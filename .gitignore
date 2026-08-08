@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Jupyter / IDE
+.ipynb_checkpoints/
+.vscode/
+.idea/
+
+# Experiment outputs
+out/
+*.npy
+*.csv
+
+# Verilog build artifacts (keep template + source)
+*.vcd
+Environment/verilog/multiplier.v
+Environment/verilog/multipliermax.v
+Environment/verilog/multiplier_8bit_tb.v
+Environment/verilog/simv
+*.out
+
+# OS
+Thumbs.db
+.DS_Store

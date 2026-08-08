@@ -1,0 +1,5 @@
+numpy>=1.24
+gymnasium>=1.0
+matplotlib>=3.8
+# Opcional: entorno CUDA acelerado (solo si se dispone de GPU)
+# torch>=2.0
