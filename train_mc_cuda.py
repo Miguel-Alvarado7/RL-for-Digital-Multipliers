@@ -135,6 +135,18 @@ def main():
         help="No generar learning_curve_cuda.png.",
     )
 
+    # --early-stop: umbral de retorno para detener el entrenamiento cuando
+    #   algún episodio del batch lo alcanza o supera (retorno CUDA en [-10, 0],
+    #   0 = circuito perfecto). Acepta:
+    #     - un número (p. ej. -0.5): detiene al alcanzar ese umbral;
+    #     - 'none' / 'off': desactiva el early stop (None en el agente), forzando
+    #       a ejecutar siempre los n_batches completos.
+    #   Valor por defecto: 0.0 (detiene en cuanto hay un circuito perfecto).
+    parser.add_argument(
+        "--early-stop", type=str, default="0.0",
+        help="Umbral de early stop (default: 0.0). 'none'/'off' lo desactiva.",
+    )
+
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -188,12 +200,16 @@ def main():
             bi = int(returns_tensor.argmax().item())
             best_grid = env.get_single_state(bi)   # dict 'suma_grid' + cursor
         mean_b = float(np.mean(returns_list))
-        if b % 10 == 0 or b == n_batches - 1:
+        if b % 100 == 0 or b == n_batches - 1:
             print(f"batch={b:4d}/{n_batches}  eps={epsilon:.3f}  "
                   f"mean={mean_b:8.3f}  best={best_return:8.3f}")
 
+    # Convertir --early-stop: 'none'/'off' => None (desactivado), si no => float.
+    early_stop_val = None if args.early_stop.strip().lower() in ("none", "off") \
+        else float(args.early_stop)
+
     records, stopped = agent.train(
-        env, n_batches, on_batch=on_batch, early_stop_return=0.0,
+        env, n_batches, on_batch=on_batch, early_stop_return=early_stop_val,
     )
 
     print(f"Batches ejecutados: {len(records) // env.n_envs}  "
