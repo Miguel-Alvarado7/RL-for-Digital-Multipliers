@@ -394,17 +394,25 @@ class BinaryMathEnvCUDAOptimized:
         self.done[idx] = False
         self.rewards[idx] = 0.0
 
-    def get_single_state(self, env_idx: int) -> Dict:
-        """Devuelve estado de un entorno como dict."""
-        grid = self.suma_grid[env_idx].cpu().tolist()
+    def grid_to_state(self, grid_1d) -> Dict:
+        """Convierte una rejilla 1D (índices de acción) en un dict de estado.
+
+        Útil para serializar una rejilla sin depender del estado actual del
+        entorno (p. ej. una rejilla ya sobrescrita por una corrida greedy).
+        """
+        grid = grid_1d.cpu().tolist() if torch.is_tensor(grid_1d) else list(grid_1d)
         grid_strs = [
             self.possible_actions[idx] if idx >= 0 else ' '
             for idx in grid
         ]
         return {
             'suma_grid': grid_strs,
-            'cursor_position': int(self.cursor_pos[env_idx].item()),
+            'cursor_position': int(self.CC),
         }
+
+    def get_single_state(self, env_idx: int) -> Dict:
+        """Devuelve estado de un entorno como dict."""
+        return self.grid_to_state(self.suma_grid[env_idx])
 
     def clone_env(self, src_idx: int, dst_idx):
         """Clona entorno dentro del batch."""

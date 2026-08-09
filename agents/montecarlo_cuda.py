@@ -193,6 +193,12 @@ class MonteCarloAgentCUDA:
             states, actions, returns = self.collect_batch(env, epsilon)
             self.update(states, actions, returns)
 
+            # Snapshot de las rejillas del batch ANTES de que la corrida greedy
+            # (collect_batch llama a env.reset()) pise env.suma_grid. Sin esto,
+            # on_batch leería la rejilla de la greedy y guardaría un circuito
+            # incorrecto como "best", aunque best_return fuera 0.0.
+            batch_grids = env.suma_grid.clone()
+
             ret_list = returns.cpu().tolist()
             for r in ret_list:
                 records.append((ep_counter, epsilon, r))
@@ -218,7 +224,7 @@ class MonteCarloAgentCUDA:
                     stopped = True
 
             if on_batch is not None:
-                on_batch(b, epsilon, returns, ret_list, greedy_info)
+                on_batch(b, epsilon, returns, ret_list, greedy_info, batch_grids)
 
             if stopped:
                 break

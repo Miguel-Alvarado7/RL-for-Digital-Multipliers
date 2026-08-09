@@ -191,14 +191,18 @@ def main():
     best_grid = None
     best_ep = -1
 
-    def on_batch(b, epsilon, returns_tensor, returns_list, greedy_info=None):
+    def on_batch(b, epsilon, returns_tensor, returns_list, greedy_info=None,
+                 batch_grids=None):
         nonlocal best_return, best_grid, best_ep
         batch_max = returns_tensor.max().item()
         if batch_max > best_return:
             best_return = batch_max
             best_ep = b
             bi = int(returns_tensor.argmax().item())
-            best_grid = env.get_single_state(bi)   # dict 'suma_grid' + cursor
+            # Usar la rejilla del batch de comportamiento (snapshot antes de la
+            # greedy); env.suma_grid ya pudo haber sido sobrescrito por la
+            # corrida greedy (collect_batch resetea el entorno).
+            best_grid = env.grid_to_state(batch_grids[bi])
         mean_b = float(np.mean(returns_list))
         if b % 100 == 0 or b == n_batches - 1:
             print(f"batch={b:4d}/{n_batches}  eps={epsilon:.3f}  "
