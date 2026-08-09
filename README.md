@@ -32,11 +32,16 @@ python train_mc.py --bits 2 --episodes 1000
 # Entrenamiento batched (GPU; usa CPU automáticamente si no hay CUDA)
 python train_mc_cuda.py --n-envs 512 --episodes 100000
 
-# Verificar el Verilog del mejor circuito encontrado
-cd out
-iverilog -s test_multiplier_tb -o simv best_multiplier_cuda.v test_multiplier_tb.v
-vvp simv
+# Verificar el Verilog del mejor circuito encontrado (desde la raíz del repo)
+iverilog -s test_multiplier_tb -o out/simv out/best_multiplier_cuda.v verification/test_multiplier_tb.v
+vvp out/simv
 ```
+
+Nota: los testbenches viven en `verification/` (versionados) y los circuitos
+generados en `out/` (ignorados por git). El testbench de 2 bits es el que
+verifica `best_multiplier_cuda.v` tras entrenar con `--bits 2`; para otros
+`--bits` hay que generar un testbench equivalente (anchos `[N-1:0]` y barrido
+hasta `2^N-1`).
 
 ## Estructura
 
