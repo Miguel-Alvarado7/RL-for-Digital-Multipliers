@@ -191,7 +191,7 @@ def main():
     best_grid = None
     best_ep = -1
 
-    def on_batch(b, epsilon, returns_tensor, returns_list):
+    def on_batch(b, epsilon, returns_tensor, returns_list, greedy_info=None):
         nonlocal best_return, best_grid, best_ep
         batch_max = returns_tensor.max().item()
         if batch_max > best_return:
@@ -203,6 +203,13 @@ def main():
         if b % 100 == 0 or b == n_batches - 1:
             print(f"batch={b:4d}/{n_batches}  eps={epsilon:.3f}  "
                   f"mean={mean_b:8.3f}  best={best_return:8.3f}")
+        # Monitoreo de la política greedy (corrida ε=0, determinista).
+        if greedy_info is not None:
+            g_mean = greedy_info['mean']
+            state = "confirmado" if greedy_info['confirmed'] else "no confirmado"
+            print(f"    greedy: batch={b:4d}  mean={g_mean:8.3f}  "
+                  f"candidato={'si' if greedy_info['candidate'] else 'no'}  "
+                  f"estado={state}")
 
     # Convertir --early-stop: 'none'/'off' => None (desactivado), si no => float.
     early_stop_val = None if args.early_stop.strip().lower() in ("none", "off") \
@@ -210,10 +217,11 @@ def main():
 
     records, stopped = agent.train(
         env, n_batches, on_batch=on_batch, early_stop_return=early_stop_val,
+        greedy_eval_every=10,
     )
 
     print(f"Batches ejecutados: {len(records) // env.n_envs}  "
-          f"(early_stop={'si' if stopped else 'no'})")
+          f"(early_stop_politica_greedy={'si' if stopped else 'no'})")
 
     # =========================================================================
     # Evaluación greedy con episodios frescos (generalización)

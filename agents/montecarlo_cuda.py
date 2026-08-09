@@ -150,25 +150,44 @@ class MonteCarloAgentCUDA:
     # Entrenamiento y evaluación
     # =========================================================================
 
-    def train(self, env, n_batches, on_batch=None, early_stop_return=0.0):
+    def train(self, env, n_batches, on_batch=None, early_stop_return=0.0,
+              greedy_eval_every=10):
         """Entrena por `n_batches` batches. Cada batch = n_envs episodios.
+
+        Criterio de parada HÍBRIDO (política greedy, no episodio suelto):
+          1. Candidato rápido: si un episodio del behavior policy (ε-greedy)
+             alcanza `early_stop_return`, NO es victoria aún — la exploración
+             puede acertar un circuito por suerte sin que Q generalice.
+          2. Confirmación: se ejecuta una corrida greedy (ε=0). Como el estado
+             es solo el cursor, la política greedy es determinista: una corrida
+             caracteriza por completo a la política.
+          3. Solo se detiene si la corrida greedy cumple el umbral en TODOS
+             los entornos ((g_returns >= umbral).all()). Si el candidato no se
+             confirma, se continúa entrenando (se reporta vía callback).
+          Cada `greedy_eval_every` batches se ejecuta la corrida greedy aunque
+          no haya candidato, para monitorear la convergencia real de la política.
 
         Args:
             env:               Entorno CUDA batched.
             n_batches:         Número de batches (cada uno evalúa n_envs episodios).
             on_batch:          Callback opcional on_batch(batch_idx, epsilon,
-                               returns_tensor, returns_list) para logging.
-            early_stop_return: Detiene en cuanto algún episodio alcanza este
-                               retorno. En CUDA el óptimo es 0 (circuito
-                               perfecto), a diferencia del agente CPU donde es 100.
+                               returns_tensor, returns_list, greedy_info) para
+                               logging. greedy_info es dict (o None): con claves
+                               'mean', 'candidate', 'confirmed'.
+            early_stop_return: Umbral de retorno. None desactiva la parada.
+                               En CUDA el óptimo es 0 (circuito perfecto).
+            greedy_eval_every: Cada cuántos batches se evalúa la política greedy
+                               (0 desactiva el monitoreo periódico).
 
         Returns:
             records: lista de (episodio_global, epsilon, retorno) por episodio real.
-            stopped: True si se detuvo por early_stop.
+            stopped: True si se detuvo porque la política greedy quedó confirmada.
         """
         records = []
         stopped = False
         ep_counter = 0
+        threshold = early_stop_return if early_stop_return is not None else 0.0
+
         for b in range(n_batches):
             epsilon = self.epsilon_at(b, n_batches)
             states, actions, returns = self.collect_batch(env, epsilon)
@@ -179,11 +198,29 @@ class MonteCarloAgentCUDA:
                 records.append((ep_counter, epsilon, r))
                 ep_counter += 1
 
-            if on_batch is not None:
-                on_batch(b, epsilon, returns, ret_list)
+            # ¿Hay candidato (un episodio alcanzó el umbral) o toca monitoreo?
+            candidate = early_stop_return is not None and \
+                (returns >= early_stop_return).any()
+            periodic = greedy_eval_every > 0 and b % greedy_eval_every == 0
 
-            if early_stop_return is not None and (returns >= early_stop_return).any():
-                stopped = True
+            greedy_info = None
+            if candidate or periodic:
+                _, _, g_returns = self.collect_batch(env, epsilon=0.0)
+                g_list = g_returns.cpu().tolist()
+                confirmed = (g_returns >= threshold).all()
+                greedy_info = {
+                    'mean': float(np.mean(g_list)),
+                    'candidate': bool(candidate),
+                    'confirmed': bool(confirmed),
+                }
+                # Parar solo si el candidato se confirma con la política greedy.
+                if candidate and confirmed:
+                    stopped = True
+
+            if on_batch is not None:
+                on_batch(b, epsilon, returns, ret_list, greedy_info)
+
+            if stopped:
                 break
 
         return records, stopped
