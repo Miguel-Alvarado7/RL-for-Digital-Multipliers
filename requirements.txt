@@ -1,5 +1,8 @@
 numpy>=1.24
 gymnasium>=1.0
 matplotlib>=3.8
-# Opcional: entorno CUDA acelerado (solo si se dispone de GPU)
-# torch>=2.0
+# Entorno CUDA acelerado (agentes batched: MonteCarloAgentCUDA, MCTS).
+# Si no hay GPU, torch usa fallback a CPU automáticamente.
+# Instalación con soporte CUDA (RTX 40x/50x):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+torch>=2.0

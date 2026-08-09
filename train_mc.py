@@ -87,8 +87,11 @@ def main():
                   f"return={return_:8.2f}  best={best_return:8.2f}")
 
     returns, epsilons = agent.train(
-        env, args.episodes, base_seed=args.seed, on_episode=on_episode
+        env, args.episodes, base_seed=args.seed, on_episode=on_episode,
+        early_stop_return=100.0,
     )
+
+    print(f"Episodios ejecutados: {len(returns)}")
 
     # Evaluación greedy con semillas frescas (generalización)
     np.random.seed(args.seed + 3)

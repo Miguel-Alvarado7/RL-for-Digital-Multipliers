@@ -23,6 +23,7 @@ Environment/verilog/multipliermax.v
 Environment/verilog/multiplier_8bit_tb.v
 Environment/verilog/simv
 *.out
+ref_simv
 
 # OS
 Thumbs.db

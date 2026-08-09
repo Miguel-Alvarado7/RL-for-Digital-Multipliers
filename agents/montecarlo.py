@@ -65,14 +65,19 @@ class MonteCarloAgent:
             self.Q[s, a] += self.alpha * (return_ - self.Q[s, a])
             self.N[s, a] += 1
 
-    def train(self, env, episodes, base_seed=42, on_episode=None):
+    def train(self, env, episodes, base_seed=42, on_episode=None,
+              early_stop_return=None):
         """Entrena el agente por `episodes` episodios.
+
+        Si `early_stop_return` no es None, detiene el entrenamiento en cuanto
+        un episodio alcanza ese retorno (p. ej. el óptimo de 100.0).
 
         Nota: la secuencia de casos de prueba del entorno (np.random global)
         debe estar sembrada por el llamador para reproducibilidad.
         """
         returns = np.empty(episodes)
         epsilons = np.empty(episodes)
+        stopped = False
         for ep in range(episodes):
             epsilon = self.epsilon_at(ep, episodes)
             episode, return_ = self.collect_episode(env, epsilon, seed=base_seed + ep)
@@ -81,6 +86,12 @@ class MonteCarloAgent:
             epsilons[ep] = epsilon
             if on_episode is not None:
                 on_episode(ep, return_, epsilon)
+            if early_stop_return is not None and return_ >= early_stop_return:
+                stopped = True
+                break
+        if stopped:
+            returns = returns[: ep + 1]
+            epsilons = epsilons[: ep + 1]
         return returns, epsilons
 
     def greedy_action(self, s):
