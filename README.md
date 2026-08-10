@@ -30,7 +30,7 @@ pip install pygame          # opcional
 python train_mc.py --bits 2 --episodes 1000
 
 # Entrenamiento batched (GPU; usa CPU automáticamente si no hay CUDA)
-python train_mc_cuda.py --n-envs 512 --episodes 100000
+python train_mc_cuda.py --n-envs 1024 --episodes 262144
 
 # Verificar el Verilog del mejor circuito encontrado (desde la raíz del repo)
 iverilog -s test_multiplier_tb -o out/simv out/best_multiplier_cuda.v verification/test_multiplier_tb.v
@@ -53,6 +53,10 @@ hasta `2^N-1`).
 ## Flags útiles (train_mc_cuda.py)
 
 - `--bits N` / `--height N` — tamaño del multiplicador y filas de la tabla
-- `--n-envs N` / `--episodes N` — paralelismo y presupuesto de episodios
+- `--n-envs N` / `--episodes N` — paralelismo y presupuesto de episodios.
+  Un batch es un único GEMM, así que `--n-envs` bajo no acelera nada (con 64 o
+  con 4096 el batch tarda lo mismo). Lo que gobierna el aprendizaje es el
+  número de batches = `episodes / n_envs`: al subir uno, sube el otro.
+- `--baseline-batches N` — batches de la referencia aleatoria (default 8)
 - `--device cuda|cpu` — forzar dispositivo (por defecto `cuda` con fallback)
 - `--early-stop VAL` — umbral de parada (0.0 = circuito perfecto; `none` lo desactiva)

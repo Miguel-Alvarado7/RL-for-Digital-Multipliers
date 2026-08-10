@@ -9,7 +9,12 @@ Diferencia clave vs. MonteCarloAgent (agents/montecarlo.py):
 
 Estado = cursor_pos. Como todos los entornos del batch avanzan en lockstep
 (cada paso rellena exactamente una celda en todos), el cursor es uniforme
-entre entornos en cada paso: s = cursor_pos[0] (0..CC-1).
+entre entornos en cada paso y vale exactamente t: s = t (0..CC-1).
+
+De ahí sale la optimización principal: la política NO depende del contenido de
+la rejilla, solo del paso. Un episodio entero se muestrea por adelantado en
+tres kernels y se evalúa de una sola vez (env.commit_episodes), en lugar de CC
+iteraciones de Python con ~4 sincronizaciones CPU<->GPU cada una.
 
 Recompensa: en modo no-incremental solo llega al terminar el episodio
 (env.rewards). Rango CUDA:
@@ -18,7 +23,9 @@ Recompensa: en modo no-incremental solo llega al terminar el episodio
 Al ser recompensas terminales y el cursor estrictamente creciente, ningún
 par (s, a) se repite dentro de un episodio: first-visit == every-visit.
 
-Update vectorizado:  Q[s, a] += alpha * (G_i - Q[s, a])   para cada episodio i.
+Update vectorizado:  Q[s, a] += alpha * (media de los G_i de los episodios que
+visitaron (s, a) - Q[s, a]).  Ver MonteCarloAgentCUDA.update sobre por qué el
+promedio tiene que ser explícito.
 """
 
 import numpy as np
@@ -78,22 +85,27 @@ class MonteCarloAgentCUDA:
         frac = episode / (max_episodes - 1)
         return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * frac
 
-    def _sample_actions(self, s, epsilon, n):
-        """Muestrea n acciones epsilon-greedy para el estado s.
+    def _sample_episode_actions(self, T, n, epsilon):
+        """Muestrea el episodio COMPLETO de golpe: (T, n) acciones epsilon-greedy.
 
-        En un batch, todos los entornos comparten el mismo cursor s, así que
-        se usa una sola fila Q[s]. Cada entorno decide por separado:
+        Cada entorno decide por separado en cada paso:
           - con prob epsilon: acción aleatoria uniforme (exploración);
-          - con prob 1-eps  : argmax(Q[s]) (explotación).
+          - con prob 1-eps  : argmax(Q[t]) (explotación).
+
+        Clave del rendimiento: el estado es únicamente el cursor, y el cursor
+        en el paso t vale exactamente t en todos los entornos. La política por
+        tanto NO depende de lo que se haya escrito en la rejilla, y Q no cambia
+        dentro de un batch. Así que las CC decisiones de un episodio se pueden
+        tomar por adelantado, en tres kernels, en lugar de CC iteraciones de
+        Python con sus sincronizaciones CPU<->GPU.
 
         Returns:
-            (n,) LongTensor en self.device.
+            (T, n) LongTensor en self.device.
         """
-        q = self.Q[s]  # (n_actions,)
-        greedy = int(q.argmax().item())
-        explore = torch.rand(n, device=self.device) < epsilon
-        random_a = torch.randint(0, q.shape[0], (n,), device=self.device)
-        return torch.where(explore, random_a, greedy)
+        greedy = self.Q[:T].argmax(dim=1)                     # (T,) sin .item()
+        explore = torch.rand(T, n, device=self.device) < epsilon
+        random_a = torch.randint(0, self.Q.shape[1], (T, n), device=self.device)
+        return torch.where(explore, random_a, greedy[:, None])
 
     # =========================================================================
     # Recogida y actualización de episodios (batched)
@@ -114,37 +126,47 @@ class MonteCarloAgentCUDA:
             actions: (CC, n_envs) int64 — acción a por (paso, entorno).
             returns: (n_envs,) float32 — retorno terminal G por entorno.
         """
-        env.reset()
-        n = env.n_envs
-        T = env.CC
-        states = torch.empty(T, n, dtype=torch.int64, device=self.device)
-        actions = torch.empty(T, n, dtype=torch.int64, device=self.device)
-        returns = torch.zeros(n, device=self.device)
+        n, T = env.n_envs, env.CC
 
-        for t in range(T):
-            s = int(env.cursor_pos[0].item())  # cursor uniforme en el batch
-            a = self._sample_actions(s, epsilon, n)
-            states[t] = s
-            actions[t] = a
-            r, _ = env.step(a)                 # (n_envs,) recompensa del paso
-            returns += r                       # en no-incremental solo importa la final
+        # Episodio completo sin loop de Python: ver _sample_episode_actions.
+        actions = self._sample_episode_actions(T, n, epsilon)
+        returns = env.commit_episodes(actions.T.contiguous())
+
+        # El estado en el paso t es el cursor, que vale t en todos los entornos.
+        states = torch.arange(T, device=self.device).unsqueeze(1).expand(T, n)
 
         return states, actions, returns
 
     def update(self, states, actions, returns):
-        """Actualización MC vectorizada: Q[s,a] += alpha*(G - Q[s,a]).
+        """Actualización MC vectorizada: Q[s,a] += alpha*(mean(G) - Q[s,a]).
+
+        Promedia sobre TODOS los episodios del batch que visitaron (s, a).
+        Esto importa: `Q[states, actions] += ...` con indexación avanzada hace
+        un read-modify-write, y ante índices duplicados —inevitables, porque
+        n_envs episodios comparten los mismos CC estados— solo sobrevive la
+        escritura de UN entorno, elegido de forma indefinida. Con n_envs=64 eso
+        descartaba ~63 de cada 64 retornos, y subir n_envs no mejoraba el
+        aprendizaje en absoluto. index_put_(accumulate=True) sí acumula.
 
         Args:
             states:  (T, n_envs) int64 — estados visitados.
             actions: (T, n_envs) int64 — acciones ejecutadas.
             returns: (n_envs,) float32 — retornos terminales por entorno.
-
-        Nota: Q[states, actions] con estados/actions 2D devuelve un tensor
-        (T, n_envs) de los valores actuales; el incremento se aplica in-place.
         """
-        target = self.Q[states, actions]
-        self.Q[states, actions] += self.alpha * (returns[None, :] - target)
-        self.N[states, actions] += 1
+        s_flat = states.reshape(-1)
+        a_flat = actions.reshape(-1)
+        g_flat = returns[None, :].expand_as(states).reshape(-1).float()
+
+        sums = torch.zeros_like(self.Q)
+        counts = torch.zeros_like(self.Q)
+        sums.index_put_((s_flat, a_flat), g_flat, accumulate=True)
+        counts.index_put_((s_flat, a_flat), torch.ones_like(g_flat),
+                          accumulate=True)
+
+        visited = counts > 0
+        mean_G = torch.where(visited, sums / counts.clamp(min=1.0), self.Q)
+        self.Q += self.alpha * (mean_G - self.Q) * visited
+        self.N += counts.to(self.N.dtype)
 
     # =========================================================================
     # Entrenamiento y evaluación
@@ -171,8 +193,8 @@ class MonteCarloAgentCUDA:
             env:               Entorno CUDA batched.
             n_batches:         Número de batches (cada uno evalúa n_envs episodios).
             on_batch:          Callback opcional on_batch(batch_idx, epsilon,
-                               returns_tensor, returns_list, greedy_info) para
-                               logging. greedy_info es dict (o None): con claves
+                               returns_tensor, greedy_info, batch_grids) para
+                               logging. greedy_info es dict (o None) con claves
                                'mean', 'candidate', 'confirmed'.
             early_stop_return: Umbral de retorno. None desactiva la parada.
                                En CUDA el óptimo es 0 (circuito perfecto).
@@ -183,39 +205,36 @@ class MonteCarloAgentCUDA:
             records: lista de (episodio_global, epsilon, retorno) por episodio real.
             stopped: True si se detuvo porque la política greedy quedó confirmada.
         """
-        records = []
         stopped = False
-        ep_counter = 0
         threshold = early_stop_return if early_stop_return is not None else 0.0
+        # Los retornos se acumulan en GPU y se bajan UNA vez al final: un
+        # .cpu() por batch sincroniza y serializa el pipeline sin necesidad.
+        all_returns, all_eps = [], []
 
         for b in range(n_batches):
             epsilon = self.epsilon_at(b, n_batches)
             states, actions, returns = self.collect_batch(env, epsilon)
             self.update(states, actions, returns)
 
-            # Snapshot de las rejillas del batch ANTES de que la corrida greedy
-            # (collect_batch llama a env.reset()) pise env.suma_grid. Sin esto,
-            # on_batch leería la rejilla de la greedy y guardaría un circuito
-            # incorrecto como "best", aunque best_return fuera 0.0.
-            batch_grids = env.suma_grid.clone()
+            # Las acciones del batch de comportamiento SON la rejilla; usarlas
+            # directamente evita depender de env.suma_grid, que la corrida
+            # greedy posterior sobrescribiría.
+            batch_grids = actions.T
 
-            ret_list = returns.cpu().tolist()
-            for r in ret_list:
-                records.append((ep_counter, epsilon, r))
-                ep_counter += 1
+            all_returns.append(returns)
+            all_eps.append(epsilon)
 
             # ¿Hay candidato (un episodio alcanzó el umbral) o toca monitoreo?
             candidate = early_stop_return is not None and \
-                (returns >= early_stop_return).any()
+                bool((returns >= early_stop_return).any())
             periodic = greedy_eval_every > 0 and b % greedy_eval_every == 0
 
             greedy_info = None
             if candidate or periodic:
-                _, _, g_returns = self.collect_batch(env, epsilon=0.0)
-                g_list = g_returns.cpu().tolist()
-                confirmed = (g_returns >= threshold).all()
+                g_return = float(self.greedy_return(env))
+                confirmed = g_return >= threshold
                 greedy_info = {
-                    'mean': float(np.mean(g_list)),
+                    'mean': g_return,
                     'candidate': bool(candidate),
                     'confirmed': bool(confirmed),
                 }
@@ -224,28 +243,42 @@ class MonteCarloAgentCUDA:
                     stopped = True
 
             if on_batch is not None:
-                on_batch(b, epsilon, returns, ret_list, greedy_info, batch_grids)
+                on_batch(b, epsilon, returns, greedy_info, batch_grids)
 
             if stopped:
                 break
 
+        n = env.n_envs
+        flat = torch.cat(all_returns).cpu().numpy()
+        records = [(i, all_eps[i // n], float(r)) for i, r in enumerate(flat)]
         return records, stopped
 
-    def evaluate(self, env, n_batches):
-        """Evalúa la política greedy (argmax Q) sobre n_batches de episodios.
+    def greedy_return(self, env):
+        """Retorno de la política greedy (argmax Q), evaluando UNA trayectoria.
 
-        Cada batch produce n_envs episodios greedy. Como no hay last_metrics
-        en los entornos CUDA, se reporta el retorno (proxy directo del error:
-        reward = 0 es un circuito perfecto).
+        La política greedy es determinista y el estado es solo el cursor, así
+        que los n_envs episodios de una corrida con epsilon=0 son idénticos
+        entre sí: basta uno. Medido, un batch greedy de 256 entornos producía
+        1 único retorno distinto — el 99.6% del cómputo era redundante.
 
         Returns:
-            (n_batches*n_envs,) float — retornos de cada episodio greedy.
+            float — retorno de la única trayectoria greedy.
         """
-        returns_all = []
-        for _ in range(n_batches):
-            _, _, returns = self.collect_batch(env, epsilon=0.0)
-            returns_all.extend(returns.cpu().tolist())
-        return np.asarray(returns_all)
+        greedy = self.Q[:env.CC].argmax(dim=1)          # (CC,)
+        return env.evaluate_grids(greedy.unsqueeze(0))[0].item()
+
+    def evaluate(self, env):
+        """Evalúa la política greedy (argmax Q).
+
+        Como no hay last_metrics en los entornos CUDA, se reporta el retorno
+        (proxy directo del error: reward = 0 es un circuito perfecto).
+
+        Returns:
+            (1,) float — retorno greedy. Es un array de un elemento a propósito:
+            la política es determinista, repetirla N veces daría N copias del
+            mismo número (ver greedy_return).
+        """
+        return np.asarray([self.greedy_return(env)])
 
     def greedy_action(self, s):
         """Acción greedy (argmax Q) para un estado escalar s."""

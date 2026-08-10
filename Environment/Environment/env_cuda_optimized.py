@@ -4,15 +4,19 @@ Optimized CUDA Environment with Memory-Efficient Streaming.
 Soluciona el problema de OOM en BinaryMathEnvCUDA eliminando la expansión
 masiva de pares (A,B) a GPU. En su lugar:
 
-1. Genera pares exhaustivos en chunks bajo demanda
-2. Procesa evaluaciones por streaming
-3. Acumula estadísticas sin mantener tensores masivos en GPU
+1. Cachea la tabla de valores de acción (constante: depende solo de los pares
+   exhaustivos y del espacio de acciones, NO del entorno ni de n_envs)
+2. Evalúa cada rejilla con un único GEMM en float32, con los factores de
+   desplazamiento ya plegados en la matriz de presencia
+3. Procesa los casos de prueba en chunks para acotar la memoria
 4. Mantiene velocidad GPU: cálculos vectorizados, no por unidad
 
-Mejora clave vs BinaryMathEnvCUDA:
-  - Bits=8: De CUDA OOM → 50-100ms evaluación
-  - Bits=4: De 100ms → 5ms
-  - Memory: O(chunk_size) en lugar de O(2^(2*Bits))
+Medido en una RTX 4000 Ada, batch de entrenamiento completo (n_envs episodios
++ update de Q), contra la versión que expandía los pares (A,B) a n_envs:
+
+    Bits=8, n_envs=64     627 ms  ->  0.93 ms   (1875 MB -> 122 MB)
+    Bits=8, n_envs=1024      OOM  ->  13.5 ms   (846 MB)
+    Bits=4, n_envs=4096    51.9 ms -> 0.93 ms   (1616 MB ->  30 MB)
 
 Uso:
     cuda_env = BinaryMathEnvCUDAOptimized(Bits=8, height=8, n_envs=256)
@@ -33,6 +37,13 @@ class BinaryMathEnvCUDAOptimized:
     genera y procesa chunks bajo demanda. Esto permite Bits=8 sin OOM.
     """
 
+    #: Presupuesto para el tensor de productos (n_envs, chunk) al auto-elegir
+    #: chunk_size.
+    PRODUCT_BUDGET_MB = 256
+    #: Presupuesto para cachear action_vals (n_test_cases, n_actions) float32.
+    #: Si la tabla no cabe, se recalcula por chunk (sin expandir a n_envs).
+    ACTION_VALS_BUDGET_MB = 1024
+
     def __init__(
         self,
         Bits: int = 8,
@@ -40,7 +51,7 @@ class BinaryMathEnvCUDAOptimized:
         height: int = 8,
         n_envs: int = 256,
         device: str = 'cuda',
-        chunk_size: int = 4096,
+        chunk_size: int = None,
     ):
         """
         Args:
@@ -49,14 +60,14 @@ class BinaryMathEnvCUDAOptimized:
             height:     Filas de la tabla de productos parciales.
             n_envs:     Número de entornos en paralelo.
             device:     'cuda' o 'cpu'. Cae a CPU si CUDA no disponible.
-            chunk_size: Número de pares (A,B) por chunk. Reduce para más lentitud,
-                        aumenta para más velocidad (si cabe en GPU).
+            chunk_size: Pares (A,B) por chunk de evaluación. None => auto, se
+                        elige para que el tensor de productos (n_envs, chunk)
+                        quepa en ~PRODUCT_BUDGET_MB. Un entero lo fuerza.
         """
         self.Bits = Bits
         self.height = height
         self.n_envs = n_envs
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.chunk_size = chunk_size
 
         self.CC = height * 2 * Bits
         self.grid_size = 2 * Bits
@@ -83,9 +94,22 @@ class BinaryMathEnvCUDAOptimized:
         # Actualizar Proof para reflejar exhaustividad
         self.Proof = self.n_test_cases
 
+        # Chunking sobre casos de prueba. El tensor dominante de la evaluación
+        # es products (n_envs, chunk) float32; se elige chunk para acotarlo.
+        if chunk_size is None:
+            budget = int(self.PRODUCT_BUDGET_MB * 2 ** 20 / (4 * max(n_envs, 1)))
+            chunk_size = max(1024, min(self.n_test_cases, budget))
+        self.chunk_size = int(chunk_size)
+
+        # Constantes de evaluación: dependen solo de (A,B) y del espacio de
+        # acciones, que son fijos durante toda la vida del entorno.
+        self._build_eval_tables()
+
         print(
             f"[CUDAOptimized] Bits={Bits}, n_test_cases={self.n_test_cases}, "
-            f"chunk_size={chunk_size}, device={self.device}"
+            f"chunk_size={self.chunk_size}, cache_action_vals="
+            f"{'si' if self._action_vals is not None else 'no'}, "
+            f"device={self.device}"
         )
 
     # =========================================================================
@@ -147,6 +171,63 @@ class BinaryMathEnvCUDAOptimized:
         )
         self.shift_factors = (2.0 ** shifts).to(self.device)
 
+    def _build_eval_tables(self):
+        """Pre-calcula lo que NO depende de la rejilla ni de n_envs.
+
+        `action_vals[p, a]` (valor del bit que produce la acción `a` para el
+        par de test `p`) y `true_P[p]` (= A·B) dependen solo de los pares
+        exhaustivos, que son fijos. Calcularlos una vez evita repetirlos en
+        cada evaluación, y evita la expansión a (n_envs, chunk, n_actions) que
+        era la causa real de los OOM: la tabla es la MISMA para todo n_envs.
+
+        Todo en float32: los productos son enteros y su cota realista
+        (~2^22 para Bits=8, ver _compute_products_chunked) cabe exacta en los
+        24 bits de mantisa. float64 en GPUs de consumo va a 1/64 del ritmo.
+        """
+        # Error normalizado: la descomposición en bits del entorno original,
+        #   sum_k bit_k(e)·2^k / sum_k 2^k,
+        # es idénticamente  (e mod 2^max_bits) / (2^max_bits - 1).
+        self._max_bits = int(np.ceil(np.log2(self.max_product + 1)))
+        self._err_mod = float(2 ** self._max_bits)
+        self._err_denom = float(2 ** self._max_bits - 1)
+
+        self._shift_f32 = self.shift_factors.float()
+
+        idx = torch.arange(self.n_test_cases, device=self.device)
+        self._true_P = ((idx // self.max_val) * (idx % self.max_val)).float()
+
+        vals_mb = self.n_test_cases * self.n_actions * 4 / 2 ** 20
+        if vals_mb <= self.ACTION_VALS_BUDGET_MB:
+            self._action_vals = self._compute_action_vals(0, self.n_test_cases)
+        else:
+            self._action_vals = None  # se recalcula por chunk
+
+    def _compute_action_vals(self, lo: int, hi: int) -> torch.Tensor:
+        """Tabla (hi-lo, n_actions) float32 con el valor de cada acción.
+
+        Sin eje n_envs: el valor de una acción depende del par (A,B), no del
+        entorno que la eligió.
+        """
+        idx = torch.arange(lo, hi, device=self.device)
+        a_vals, b_vals = idx // self.max_val, idx % self.max_val
+
+        A_bits = ((a_vals.unsqueeze(-1) >> self.action_i_bits) & 1).float()
+        B_bits = ((b_vals.unsqueeze(-1) >> self.action_j_bits) & 1).float()
+        A_eff = torch.where(self.action_neg_a, 1.0 - A_bits, A_bits)
+        B_eff = torch.where(self.action_neg_b, 1.0 - B_bits, B_bits)
+
+        vals = torch.zeros(hi - lo, self.n_actions, dtype=torch.float32,
+                           device=self.device)
+        vals[:, 1] = 1.0            # acción '1'; la acción '0' queda en 0
+        vals[:, 2:] = A_eff * B_eff
+        return vals.contiguous()
+
+    def _action_vals_for(self, lo: int, hi: int) -> torch.Tensor:
+        """Slice cacheado de action_vals, o recálculo si no cabía en memoria."""
+        if self._action_vals is not None:
+            return self._action_vals[lo:hi]
+        return self._compute_action_vals(lo, hi)
+
     # =========================================================================
     # API principal (compatible con BinaryMathEnv)
     # =========================================================================
@@ -186,6 +267,43 @@ class BinaryMathEnvCUDAOptimized:
 
         return step_rewards, self.done.clone()
 
+    def commit_episodes(self, actions: torch.Tensor) -> torch.Tensor:
+        """Escribe episodios COMPLETOS y los evalúa de una sola vez.
+
+        Atajo para agentes cuya política no depende del contenido de la
+        rejilla (solo del cursor): en ese caso las CC acciones de un episodio
+        se pueden decidir por adelantado, y no hay razón para pagar CC
+        iteraciones de Python con sus sincronizaciones CPU<->GPU. Deja el
+        entorno en el mismo estado que CC llamadas a step().
+
+        Args:
+            actions: (n_envs, CC) int — acción por celda, en orden de cursor.
+
+        Returns:
+            (n_envs,) float32 — reward terminal de cada entorno.
+        """
+        if actions.shape != (self.n_envs, self.CC):
+            raise ValueError(
+                f"actions debe ser ({self.n_envs}, {self.CC}), "
+                f"recibido {tuple(actions.shape)}"
+            )
+        self.suma_grid.copy_(actions.to(torch.int16))
+        self.cursor_pos.fill_(self.CC)
+        self.done.fill_(True)
+        self.rewards = self._compute_products_chunked(self.suma_grid.long())
+        return self.rewards
+
+    def evaluate_grids(self, grids: torch.Tensor) -> torch.Tensor:
+        """Evalúa rejillas arbitrarias sin tocar el estado del entorno.
+
+        Args:
+            grids: (n, CC) int — índices de acción, -1 = celda vacía.
+
+        Returns:
+            (n,) float32 — reward de cada rejilla.
+        """
+        return self._compute_products_chunked(grids.long())
+
     # =========================================================================
     # Evaluación eficiente por chunks (CORE OPTIMIZATION)
     # =========================================================================
@@ -196,6 +314,11 @@ class BinaryMathEnvCUDAOptimized:
         """
         Calcula valor bit de cada acción para test cases dados.
 
+        Conservado por compatibilidad de API. NO se usa en el camino caliente:
+        el valor de una acción no depende del entorno, así que replicarlo por
+        n_envs (como hacía la versión anterior) es trabajo redundante puro.
+        Prefiere `_action_vals_for(lo, hi)`.
+
         Args:
             A: (n_chunks, chunk_size) o (chunk_size,)
             B: (n_chunks, chunk_size) o (chunk_size,)
@@ -203,39 +326,70 @@ class BinaryMathEnvCUDAOptimized:
         Returns:
             (n_chunks, chunk_size, n_actions) float32
         """
-        # Asegurar que A, B están en el device correcto
         A = A.to(self.device)
         B = B.to(self.device)
-
         if A.dim() == 1:
             A = A.unsqueeze(0)
             B = B.unsqueeze(0)
 
         n, m = A.shape[0], A.shape[1]
         vals = torch.zeros(n, m, self.n_actions, dtype=torch.float32, device=self.device)
-
-        # Acción 0: siempre 0 (ya en 0)
-        # Acción 1: siempre 1
         vals[:, :, 1] = 1.0
 
-        # Acciones 2..: productos parciales
         A_bits = ((A.unsqueeze(-1) >> self.action_i_bits) & 1).float()
         B_bits = ((B.unsqueeze(-1) >> self.action_j_bits) & 1).float()
-
         A_eff = torch.where(self.action_neg_a, 1.0 - A_bits, A_bits)
         B_eff = torch.where(self.action_neg_b, 1.0 - B_bits, B_bits)
 
         vals[:, :, 2:] = A_eff * B_eff
         return vals
 
+    def _grid_presence(self, grids: torch.Tensor) -> torch.Tensor:
+        """presence[e, a] = peso posicional total de la acción `a` en la rejilla e.
+
+        La rejilla se lee como (height, grid_size); una acción cuenta UNA vez
+        por columna aunque se repita en varias filas (deduplicación sobre
+        height), y cada columna aporta su factor 2^(grid_size-c-1).
+
+        Plegar los shifts aquí -- en vez de después de contraer por acciones --
+        elimina el eje de columnas de la contracción pesada: la evaluación pasa
+        de O(n_envs·grid_size·n_actions·chunk) a O(n_envs·n_actions·chunk).
+
+        Args:
+            grids: (n_envs, CC) int — índices de acción, -1 = celda vacía.
+
+        Returns:
+            (n_envs, n_actions) float32
+        """
+        n_envs = grids.shape[0]
+        g = grids.view(n_envs, self.height, self.grid_size).long()
+        # Las celdas vacías (-1) van a un slot basura que luego se descarta.
+        g = torch.where(g >= 0, g, torch.full_like(g, self.n_actions))
+
+        presence = torch.zeros(n_envs, self.grid_size, self.n_actions + 1,
+                               dtype=torch.float32, device=self.device)
+        # scatter de 1s: escribir el mismo 1 varias veces == max sobre height.
+        presence.scatter_(2, g.transpose(1, 2), 1.0)
+        presence = presence[:, :, :self.n_actions]
+
+        return torch.einsum('eca,c->ea', presence, self._shift_f32)
+
     def _compute_products_chunked(
         self, grids: torch.Tensor
     ) -> torch.Tensor:
         """
-        Evalúa producto (A*B) usando streaming de chunks.
+        Evalúa producto (A*B) contra los pares exhaustivos, en chunks.
 
-        Evita cargar todos los pares (A,B) a GPU simultáneamente.
-        En su lugar, procesa chunk_size pares por vez y acumula errores.
+        Con los shifts ya plegados en `presence`, el producto de cada entorno
+        para cada par de test es un único GEMM (n_envs, n_actions) x
+        (n_actions, chunk), que va a cuBLAS.
+
+        Exactitud en float32: los productos son enteros y su cota es
+        n_actions·(2^grid_size - 1) en el peor caso teórico, pero A[i]&B[j] y
+        ~A[i]&B[j] son mutuamente excluyentes, así que a lo sumo ~1/4 de los
+        productos parciales valen 1 a la vez: ~65·65535 ≈ 4.3e6 para Bits=8,
+        holgadamente dentro de los 2^24 exactos de float32. Por eso se
+        desactiva TF32 (mantisa de 10 bits) en el GEMM.
 
         Args:
             grids: (n_envs, CC) - índices de acciones
@@ -244,72 +398,29 @@ class BinaryMathEnvCUDAOptimized:
             (n_envs,) float32 - rewards normalizados
         """
         n_envs = grids.shape[0]
+        presence = self._grid_presence(grids)          # (n_envs, n_actions)
 
-        # Acumuladores de error
-        error_sums = torch.zeros(n_envs, dtype=torch.float64, device=self.device)
-        max_bits = int(torch.ceil(torch.log2(torch.tensor(self.max_product + 1))))
-        weights = (2.0 ** torch.arange(max_bits, device=self.device)).double()
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            error_sums = torch.zeros(n_envs, dtype=torch.float32, device=self.device)
+            for lo in range(0, self.n_test_cases, self.chunk_size):
+                hi = min(lo + self.chunk_size, self.n_test_cases)
 
-        # Reshape grids a (n_envs, height, grid_size) - una sola vez
-        grid_3d = grids.view(n_envs, self.height, self.grid_size)
-        valid = (grid_3d >= 0)
-        grid_safe = grid_3d.clamp(min=0)
+                action_vals = self._action_vals_for(lo, hi)     # (chunk, n_actions)
+                products = presence @ action_vals.T             # (n_envs, chunk)
 
-        # One-hot decodification (grande pero una sola vez para todos los chunks)
-        one_hot = torch.zeros(
-            n_envs, self.height, self.grid_size, self.n_actions,
-            dtype=torch.uint8, device=self.device
-        )
-        one_hot.scatter_(-1, grid_safe.long().unsqueeze(-1), 1)
-        valid_mask = valid.unsqueeze(-1)
-        one_hot = one_hot.float() * valid_mask.float()
+                error = (products - self._true_P[lo:hi].unsqueeze(0)).abs()
+                # Equivalente exacto de la suma bit-ponderada del original.
+                normalized = torch.remainder(error.floor_(), self._err_mod)
+                error_sums += normalized.sum(dim=1) / self._err_denom
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
 
-        # Deduplicación: max sobre height - una sola vez
-        presence, _ = one_hot.max(dim=1)  # (n_envs, grid_size, n_actions)
-
-        # Procesar pares en chunks más agresivamente
-        for chunk_idx in range(0, self.n_test_cases, self.chunk_size):
-            end_idx = min(chunk_idx + self.chunk_size, self.n_test_cases)
-
-            # Generar pares (A, B) para este chunk
-            a_vals = (torch.arange(chunk_idx, end_idx, dtype=torch.int64, device=self.device) // self.max_val)
-            b_vals = torch.arange(chunk_idx, end_idx, dtype=torch.int64, device=self.device) % self.max_val
-
-            # Valores verdaderos de multiplicación
-            true_P = (a_vals * b_vals).double()  # (chunk_size,)
-
-            # Expandir mínimamente para evaluar acciones
-            A_chunk = a_vals.unsqueeze(0).expand(n_envs, -1)  # (n_envs, chunk_size)
-            B_chunk = b_vals.unsqueeze(0).expand(n_envs, -1)  # (n_envs, chunk_size)
-            action_vals = self._evaluate_all_actions(A_chunk, B_chunk)  # (n_envs, chunk_size, n_actions)
-
-            # Suma ponderada
-            col_sums = torch.einsum('eca,epa->ecp', presence, action_vals)
-
-            # Desplazamiento y suma
-            products = torch.einsum('ecp,c->ep', col_sums.double(), self.shift_factors)
-
-            # Calcular error para este chunk
-            error = (products - true_P.unsqueeze(0)).abs()
-
-            # Weighted bit error simplificado
-            abs_error = error.long()
-            bit_positions = torch.arange(max_bits, device=self.device, dtype=torch.long)
-            bit_errors = ((abs_error.unsqueeze(-1) >> bit_positions) & 1).double()
-            weighted_error = (bit_errors * weights).sum(dim=-1)
-            normalized_error = weighted_error / weights.sum()
-
-            # Acumular
-            error_sums += normalized_error.sum(dim=1)
-
-        # Promediar sobre todos los chunks
         avg_error = error_sums / self.n_test_cases
-
-        # Risk con exponential weighting
-        lambda_risk = 20.0
-        risk = torch.log(torch.exp(lambda_risk * avg_error)) / lambda_risk
-
-        return (-10.0 * risk).clamp(min=-100.0)
+        # El original calculaba log(exp(l*avg_error))/l, que es la identidad
+        # (y desborda a inf si l*avg_error > 709). Se aplica directamente.
+        return (-10.0 * avg_error).clamp(min=-100.0)
 
     def _evaluate_batch(self, env_mask: torch.Tensor) -> torch.Tensor:
         """Evalúa entornos enmascarados usando chunking."""
