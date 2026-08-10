@@ -1,6 +1,6 @@
 # Entorno de Aprendizaje por Refuerzo para Multiplicadores Binarios
 
-Documentación exhaustiva del paquete `Environment/Environment`.
+Documentación exhaustiva del paquete `envs`.
 
 Este documento describe en detalle el **entorno de Aprendizaje por Refuerzo (RL)** que
 sintetiza circuitos multiplicadores binarios. Cubre las cuatro clases del paquete, el
@@ -41,12 +41,12 @@ motiva el uso de RL (y de búsqueda tipo MCTS) para explorar tablas válidas.
 ## 2. Arquitectura del paquete
 
 ```
-Environment/Environment/
-├── __init__.py               Re-exporta las 4 clases (imports perezosos)
-├── env_base.py               BinaryMathEnv          — núcleo conceptual (gym.Env)
-├── environment.py            BinaryMathEnvSecuencial — versión con render pygame
-├── env_cuda.py               BinaryMathEnvCUDA       — batch vectorizado en GPU
-└── env_cuda_optimized.py     BinaryMathEnvCUDAOptimized — batch con streaming por chunks
+envs/
+├── __init__.py          Re-exporta las 4 clases (imports perezosos)
+├── base.py              BinaryMathEnv          — núcleo conceptual (gym.Env)
+├── pygame_env.py        BinaryMathEnvSecuencial — versión con render pygame
+├── cuda.py              BinaryMathEnvCUDA       — batch vectorizado en GPU
+└── cuda_optimized.py    BinaryMathEnvCUDAOptimized — batch con streaming por chunks
 ```
 
 | Clase | Motor de evaluación | Interfaz | Uso típico |
@@ -65,9 +65,9 @@ dependencias pesadas (`pygame`, `torch`) se cargan bajo demanda:
 
 ```python
 _LAZY_MODULES = {
-    'BinaryMathEnvSecuencial': '.environment',
-    'BinaryMathEnvCUDA': '.env_cuda',
-    'BinaryMathEnvCUDAOptimized': '.env_cuda_optimized',
+    'BinaryMathEnvSecuencial': '.pygame_env',
+    'BinaryMathEnvCUDA': '.cuda',
+    'BinaryMathEnvCUDAOptimized': '.cuda_optimized',
 }
 
 def __getattr__(name):
@@ -79,7 +79,7 @@ def __getattr__(name):
 
 Esto permite ejecutar experimentos en CPU con **solo `numpy` + `gymnasium`** sin instalar
 `pygame` ni `torch`. `__all__` sigue listando las cuatro clases, por lo que
-`from Environment.Environment import *` continúa funcionando.
+`from envs import *` continúa funcionando.
 
 ---
 
@@ -264,12 +264,12 @@ tabla (suma_grid)  ──►  multiplier.v  +  multiplier_8bit_tb.v
    col = 3 → columna1 << 0   (bit 0)
    ```
 
-6. El código se escribe en `Environment/verilog/multiplier.v` y se almacena en
+6. El código se escribe en `out/verilog/multiplier.v` y se almacena en
    `last_verilog_code` (para visualización).
 
 ### 4.2 Generación del testbench
 
-Se lee la plantilla `Environment/verilog/testbench_template.v` y se sustituyen los
+Se lee la plantilla `verification/testbench_template.v` y se sustituyen los
 placeholders:
 
 | Placeholder | Sustitución |
@@ -508,26 +508,45 @@ Consultables con `get_column_stats()`; resetables con `reset_column_logs()`.
 
 ---
 
-## 7. `BinaryMathEnvCUDAOptimized` — streaming por chunks
+## 7. `BinaryMathEnvCUDAOptimized` — GEMM único con streaming por chunks
 
 Resuelve el **OOM (out-of-memory)** de `BinaryMathEnvCUDA` para `Bits` grandes
-(expandir `2^(2·Bits)` pares a GPU es inviable). En lugar de materializar todos los pares:
+(expandir `2^(2·Bits)` pares a GPU es inviable). Tres ideas combinadas:
 
-1. Genera los pares exhaustivos **en chunks** (`chunk_size=4096` por defecto) bajo demanda.
-2. Evalúa cada chunk con las mismas operaciones vectorizadas (`_evaluate_all_actions`,
-   `_compute_products_chunked`).
-3. **Acumula estadísticas de error** (`error_sums`) sin mantener tensores masivos en GPU.
-4. Al final promedia y aplica la misma fórmula de recompensa (riesgo exponencial).
+1. **Caché de `action_vals`** — el valor de cada acción solo depende de los pares
+   exhaustivos y del espacio de acciones, NO del entorno ni de `n_envs`. Se calcula
+   una vez (`_build_eval_tables`) y se reutiliza; si no cabe en memoria
+   (`ACTION_VALS_BUDGET_MB`, default 1024 MB), se recalcula por chunk
+   (`_action_vals_for`).
+2. **Evaluación con un único GEMM** en float32 — la rejilla se convierte en una matriz
+   de presencia `(n_envs, n_actions)` con los factores de desplazamiento ya plegados
+   (`_grid_presence`), y cada chunk de test cases se evalúa con `presence @ action_vals.T`
+   vía cuBLAS: `O(n_envs·n_actions·chunk)`. TF32 se desactiva en el GEMM por exactitud
+   (los productos son enteros y su cota realista ~4e6 para Bits=8 cabe en los 24 bits
+   de mantisa float32).
+3. **`commit_episodes` / `evaluate_grids`** — atajos para agentes cuya política solo
+   depende del cursor: escriben un episodio completo (o una rejilla arbitraria) y lo
+   evalúan de una sola vez, sin pagar CC iteraciones de Python con sus sincronizaciones
+   CPU↔GPU. El chunking (`chunk_size` auto-ajustado por presupuesto de memoria) evita
+   mantener tensores masivos.
+
+Recompensa simplificada (sin riesgo exponencial, idéntica en valor):
 
 ```
-Memoria: O(chunk_size)  en vez de  O(2^(2·Bits))
-Bits=8:  de OOM → ~50–100 ms/evaluación
-Bits=4:  de ~100 ms → ~5 ms
+avg_error = Σ_p |P_calc − P_true| / n_test_cases   (error normalizado por bit)
+reward    = −10 · avg_error,  clamp a ≥ −100
+```
+
+```
+Memoria: O(n_envs·chunk_size)  en vez de  O(n_envs · 2^(2·Bits))
+Bits=8, n_envs=64     627 ms → 0.93 ms   (1875 MB → 122 MB)
+Bits=8, n_envs=1024      OOM → 13.5 ms   (846 MB)
+Bits=4, n_envs=4096    51.9 ms → 0.93 ms (1616 MB → 30 MB)
 ```
 
 ```python
 BinaryMathEnvCUDAOptimized(Bits=8, Proof=4, height=8, n_envs=256,
-                           device='cuda', chunk_size=4096)
+                           device='cuda', chunk_size=None)
 ```
 
 **Diferencias frente a `BinaryMathEnvCUDA`:**
@@ -535,10 +554,11 @@ BinaryMathEnvCUDAOptimized(Bits=8, Proof=4, height=8, n_envs=256,
 | Característica | CUDA | CUDAOptimized |
 |---|---|---|
 | Test cases exhaustivos | tensores en GPU | generados por chunk |
+| `action_vals` | recomputa por evaluación | cacheado (una vez, sin eje n_envs) |
+| Evaluación | one-hot + einsum | un único GEMM (presence @ action_vals) |
 | Modo incremental | sí | no |
 | `no_repeat` / masking | sí | no |
-| Decodificación one-hot | por evaluación | una vez, reutilizada entre chunks |
-| Memoria | `O(2^(2·Bits))` | `O(chunk_size)` |
+| Memoria | `O(n_envs·2^(2·Bits))` | `O(n_envs·chunk_size)` |
 
 ---
 
@@ -581,7 +601,7 @@ donde `b = bit_pos`, `g = grid_size`.
   - Evaluación Verilog: Icarus Verilog (`iverilog`, `vvp`).
 - **Rutas**: las rutas de archivos (`multiplier.v`, `multipliermax.v`,
   `multiplier_8bit_tb.v`, `simv`, `testbench_template.v`) son relativas al paquete
-  (`Environment/verilog/`). El directorio se crea automáticamente al generar Verilog.
+  (`out/verilog/`). El directorio se crea automáticamente al generar Verilog.
 
 ---
 
@@ -610,11 +630,11 @@ donde `b = bit_pos`, `g = grid_size`.
 
 | Archivo | Conceptos |
 |---|---|
-| `Environment/Environment/env_base.py` | `BinaryMathEnv`, espacios de acción/observación, `step`/`reset`, `closed`, `generate_verilog`, métricas de circuito, `clone`/`get_state`/`set_state` |
-| `Environment/Environment/environment.py` | `BinaryMathEnvSecuencial`, render pygame, `clone`/`set_state` con recursos no serializables |
-| `Environment/Environment/env_cuda.py` | `BinaryMathEnvCUDA`, tensores de estado, test cases exhaustivos, modo incremental, action-masking, interfaz MCTS, logging |
-| `Environment/Environment/env_cuda_optimized.py` | `BinaryMathEnvCUDAOptimized`, streaming por chunks, reducción de memoria |
-| `Environment/Environment/__init__.py` | Re-exports y imports perezosos (PEP 562) |
-| `Environment/verilog/testbench_template.v` | Plantilla del testbench con placeholders `{regsI}`, `{regsO}`, `{Test}` |
-| `Environment/verilog/multiplier.v` *(generado)* | Circuito sintetizado a partir de la tabla |
-| `Environment/verilog/multipliermax.v` *(generado)* | Mejor circuito archivado (`min_error`) |
+| `envs/base.py` | `BinaryMathEnv`, espacios de acción/observación, `step`/`reset`, `closed`, `generate_verilog`, métricas de circuito, `clone`/`get_state`/`set_state` |
+| `envs/pygame_env.py` | `BinaryMathEnvSecuencial`, render pygame, `clone`/`set_state` con recursos no serializables |
+| `envs/cuda.py` | `BinaryMathEnvCUDA`, tensores de estado, test cases exhaustivos, modo incremental, action-masking, interfaz MCTS, logging |
+| `envs/cuda_optimized.py` | `BinaryMathEnvCUDAOptimized`, streaming por chunks, reducción de memoria |
+| `envs/__init__.py` | Re-exports y imports perezosos (PEP 562) |
+| `verification/testbench_template.v` | Plantilla del testbench con placeholders `{regsI}`, `{regsO}`, `{Test}` |
+| `out/verilog/multiplier.v` *(generado)* | Circuito sintetizado a partir de la tabla |
+| `out/verilog/multipliermax.v` *(generado)* | Mejor circuito archivado (`min_error`) |

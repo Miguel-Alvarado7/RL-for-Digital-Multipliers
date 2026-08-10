@@ -4,19 +4,26 @@ A diferencia de train_mc.py (CPU, un entorno secuencial evaluado con
 iverilog/vvp por episodio), este script ejecuta `n_envs` episodios en
 paralelo con operaciones vectorizadas de torch:
 
-    python train_mc_cuda.py [--bits 2] [--height 2] [--n-envs 1024]
-                            [--episodes 262144] [--alpha 0.1] [--seed 42]
+    python train_mc_cuda.py [--bits 2] [--height 2] [--n-envs 512]
+                            [--episodes 100000] [--alpha 0.1] [--seed 42]
                             [--device cuda] [--no-plot]
 
 Si no hay GPU, torch cae a CPU automáticamente (los tiempos bajan, pero el
 código es idéntico). El reward CUDA está en [-10, 0] con 0 = circuito
 perfecto, así que el "éxito" es acercarse a 0 (el agente CPU busca 100).
 
-Artifacts en out/:
+El entorno optimized evalúa cada rejilla con un único GEMM (action_vals
+cacheado), procesando los casos de prueba por chunks para acotar la memoria.
+Un batch es un solo GEMM: en GPU n_envs=64 y n_envs=4096 tardan lo MISMO (la
+GPU está ociosa por debajo), así que valores pequeños solo desperdician
+throughput. Si hay OOM, chunk_size se auto-ajusta a la baja.
+
+Artifacts en out/montecarlo_cuda/:
     returns_cuda.csv        retornos por episodio (MC y baseline)
     Q_cuda.npy              tabla Q aprendida
     learning_curve_cuda.png curva de aprendizaje vs baseline aleatorio
-    best_multiplier_cuda.v  Verilog del mejor circuito encontrado
+    best_multiplier_cuda.v  Verilog del mejor circuito (rank 1 del top 5)
+    best_multiplier_cuda_2.v.._5.v  Verilog de los circuitos 2º a 5º
 """
 
 import argparse
@@ -25,33 +32,14 @@ import os
 import numpy as np
 import torch
 
-from Environment.Environment import BinaryMathEnv
-from Environment.Environment import BinaryMathEnvCUDAOptimized
-from agents.montecarlo_cuda import MonteCarloAgentCUDA
+from envs import BinaryMathEnv
+from envs import BinaryMathEnvCUDAOptimized
+from agents.cuda.montecarlo import MonteCarloAgentCUDA
+from training.artifacts import TopK, save_topk, save_q, save_returns
+from training.baseline import random_baseline_cuda
+from training.plot import learning_curve
 
-OUT_DIR = "out"
-
-
-def random_baseline(env, n_batches, seed):
-    """Política aleatoria uniforme como referencia (batched).
-
-    Reutiliza el sampler del agente con epsilon=1.0 (exploración pura),
-    ejecutando n_batches de n_envs episodios en paralelo.
-
-    Returns:
-        (n_batches*n_envs,) float — retornos de cada episodio aleatorio.
-    """
-    agent = MonteCarloAgentCUDA(
-        n_states=env.CC + 1,
-        n_actions=env.n_actions,
-        device=env.device.type,
-        seed=seed,
-    )
-    returns_all = []
-    for _ in range(n_batches):
-        _, _, returns = agent.collect_batch(env, epsilon=1.0)
-        returns_all.append(returns)
-    return torch.cat(returns_all).cpu().numpy()
+OUT_DIR = "out/montecarlo_cuda"
 
 
 def main():
@@ -87,26 +75,24 @@ def main():
 
     # --n-envs: entornos en paralelo por batch.
     #   Cada batch equivale a n_envs episodios MC independientes. En GPU esto
-    #   es lo que da la aceleración (toda la evaluación es vectorizada).
-    #   Un batch es un único GEMM: medido, n_envs=64 y n_envs=4096 tardan lo
-    #   MISMO (la GPU está ociosa por debajo), así que valores pequeños solo
-    #   desperdician throughput. El coste en memoria es O(n_envs·chunk_size),
-    #   y chunk_size se auto-ajusta a la baja para compensar.
+    #   es lo que da la aceleración (toda la evaluación es vectorizada). Un
+    #   batch es un único GEMM: n_envs=64 y n_envs=4096 tardan lo mismo, así
+    #   que valores pequeños solo desperdician throughput. El coste en memoria
+    #   es O(n_envs·chunk_size) y chunk_size se auto-ajusta a la baja.
     parser.add_argument(
-        "--n-envs", type=int, default=1024,
-        help="Entornos paralelos por batch (default: 1024). Valores menores "
-             "no aceleran nada: la GPU se satura muy por encima de eso.",
+        "--n-envs", type=int, default=512,
+        help="Entornos paralelos por batch (default: 512). Reduce si hay OOM; "
+             "subir no acelera por debajo de ~1024 en GPU.",
     )
 
     # --episodes: presupuesto TOTAL de episodios de entrenamiento.
     #   Como cada batch produce n_envs episodios, el número real de batches es
     #   ceil(episodes / n_envs). epsilon decae linealmente por batch.
     parser.add_argument(
-        "--episodes", type=int, default=262144,
-        help="Presupuesto total de episodios (default: 262144 = 256 batches "
-             "de 1024). Se ejecutan ceil(episodes/n_envs) batches; lo que "
-             "gobierna el aprendizaje es el NÚMERO DE BATCHES (updates de Q), "
-             "así que al subir --n-envs hay que subir esto en proporción.",
+        "--episodes", type=int, default=100000,
+        help="Presupuesto total de episodios (default: 100000). Se ejecutan "
+             "ceil(episodes/n_envs) batches; al subir --n-envs hay que subir "
+             "esto en proporción (lo que gobierna es el Nº de batches).",
     )
 
     # --baseline-batches: batches de política aleatoria para la referencia.
@@ -185,8 +171,10 @@ def main():
 
     # Baseline aleatorio (misma escala de reward CUDA: [-10, 0]).
     np.random.seed(args.seed + 1)
-    baseline = random_baseline(env, min(args.baseline_batches, n_batches),
-                               seed=args.seed + 1_000_000)
+    baseline = random_baseline_cuda(
+        MonteCarloAgentCUDA, env,
+        min(args.baseline_batches, n_batches), seed=args.seed + 1_000_000,
+    )
     print(f"Baseline aleatorio: mean={baseline.mean():.2f} "
           f"best={baseline.max():.2f}")
 
@@ -203,20 +191,23 @@ def main():
     )
 
     best_return = -np.inf
-    best_grid = None
     best_ep = -1
+    topk = TopK(k=5)
 
     def on_batch(b, epsilon, returns_tensor, greedy_info=None,
                  batch_grids=None):
-        nonlocal best_return, best_grid, best_ep
+        nonlocal best_return, best_ep, topk
         batch_max = returns_tensor.max().item()
         if batch_max > best_return:
             best_return = batch_max
             best_ep = b
-            bi = int(returns_tensor.argmax().item())
-            # Usar la rejilla del batch de comportamiento; env.suma_grid ya
-            # pudo haber sido sobrescrito por la corrida greedy.
-            best_grid = env.grid_to_state(batch_grids[bi])
+        # Actualizar Top-5 con las rejillas del batch de comportamiento
+        # (snapshot antes de la greedy; env.suma_grid pudo haber sido
+        # sobrescrito por la corrida greedy).
+        if batch_grids is not None:
+            ret_cpu = returns_tensor.cpu()
+            for i in range(env.n_envs):
+                topk.add(ret_cpu[i].item(), tuple(batch_grids[i].tolist()))
         if b % 100 == 0 or b == n_batches - 1:
             # La media solo se materializa cuando se va a imprimir: cada
             # .item() sincroniza CPU<->GPU.
@@ -244,77 +235,34 @@ def main():
           f"(early_stop_politica_greedy={'si' if stopped else 'no'})")
 
     # =========================================================================
-    # Evaluación greedy con episodios frescos (generalización)
+    # Evaluación greedy (la política es determinista: un retorno la caracteriza)
     # =========================================================================
     eval_returns = agent.evaluate(env)
     print("\n=== Resultados MC CUDA ===")
     print(f"Best training:  reward={best_return:.3f} en batch={best_ep}  "
           f"(0 = circuito perfecto)")
-    # La política greedy es determinista: un único retorno la caracteriza.
     print(f"Eval greedy:    return={eval_returns.mean():.3f}")
     print(f"MC vs baseline: {eval_returns.mean() - baseline.mean():+.3f}")
 
     # =========================================================================
     # Artefactos
     # =========================================================================
-    np.save(os.path.join(OUT_DIR, "Q_cuda.npy"), agent.Q.cpu().numpy())
+    save_q(os.path.join(OUT_DIR, "Q_cuda.npy"), agent.Q)
+    save_returns(os.path.join(OUT_DIR, "returns_cuda.csv"), records)
 
-    header = "episode,epsilon,mc_return"
-    data = np.array(records, dtype=float)
-    np.savetxt(os.path.join(OUT_DIR, "returns_cuda.csv"), data,
-               delimiter=",", header=header, comments="")
-
-    if best_grid is not None:
-        env_best = BinaryMathEnv(Bits=args.bits, Proof=8, height=args.height)
-        env_best.suma_grid = list(best_grid["suma_grid"])
-        env_best.generate_verilog()
-        with open(os.path.join(OUT_DIR, "best_multiplier_cuda.v"), "w") as f:
-            f.write(env_best.last_verilog_code)
-        print(f"Best Verilog guardado en "
-              f"{os.path.join(OUT_DIR, 'best_multiplier_cuda.v')}")
+    save_topk(
+        topk, OUT_DIR, args.bits, args.height, "best_multiplier_cuda",
+        grid_from_key=lambda key: env.grid_to_state(list(key))['suma_grid'],
+    )
 
     if not args.no_plot:
-        _plot_learning_curve(np.array([r[2] for r in records]), baseline,
-                             eval_returns.mean(),
-                             os.path.join(OUT_DIR, "learning_curve_cuda.png"))
-
-
-def _plot_learning_curve(returns, baseline, eval_mean, path):
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    # Media móvil por sumas acumuladas: np.convolve es O(n·w) y con cientos de
-    # miles de episodios (n_envs alto) eso domina el tiempo del script.
-    window = max(10, len(returns) // 50)
-    csum = np.concatenate([[0.0], np.cumsum(returns, dtype=np.float64)])
-    smooth = (csum[window:] - csum[:-window]) / window
-
-    # La nube de puntos crudos se submuestrea: dibujar 250k marcadores tarda
-    # más que todo el entrenamiento y no aporta resolución visible.
-    step = max(1, len(returns) // 5000)
-    idx = np.arange(0, len(returns), step)
-
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(idx, returns[idx], alpha=0.15, color="tab:blue",
-            label="MC por episodio")
-    ax.plot(np.arange(window - 1, len(returns)), smooth, color="tab:blue",
-            label=f"MC media móvil (w={window})")
-    ax.axhline(baseline.mean(), color="tab:gray", ls="--",
-               label=f"Baseline aleatorio {baseline.mean():.2f}")
-    ax.axhline(eval_mean, color="tab:green", ls=":",
-               label=f"Eval greedy {eval_mean:.2f}")
-    ax.axhline(0.0, color="tab:red", ls="-.", lw=0.8,
-               label="Óptimo (reward 0)")
-    ax.set_xlabel("Episodio")
-    ax.set_ylabel("Retorno (reward CUDA, [-10, 0])")
-    ax.set_title("Monte Carlo on-policy batched - BinaryMathEnvCUDAOptimized")
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(path, dpi=120)
-    plt.close(fig)
-    print(f"Curva de aprendizaje guardada en {path}")
+        learning_curve(
+            np.array([r[2] for r in records]), baseline, eval_returns.mean(),
+            os.path.join(OUT_DIR, "learning_curve_cuda.png"),
+            title="Monte Carlo on-policy batched - BinaryMathEnvCUDAOptimized",
+            ylabel="Retorno (reward CUDA, [-10, 0])",
+            series_label="MC", optimum=0.0, optimum_label="Óptimo (reward 0)",
+        )
 
 
 if __name__ == "__main__":

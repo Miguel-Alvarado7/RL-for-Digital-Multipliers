@@ -4,7 +4,7 @@ Entorno de Aprendizaje por Refuerzo para Multiplicadores Binarios
 
 import importlib
 
-from .env_base import BinaryMathEnv
+from .base import BinaryMathEnv
 
 
 __all__ = [
@@ -18,9 +18,9 @@ __all__ = [
 # Las clases con dependencias pesadas (pygame, torch) se importan bajo demanda,
 # evitando instalarlas para experimentos en CPU.
 _LAZY_MODULES = {
-    'BinaryMathEnvSecuencial': '.environment',
-    'BinaryMathEnvCUDA': '.env_cuda',
-    'BinaryMathEnvCUDAOptimized': '.env_cuda_optimized',
+    'BinaryMathEnvSecuencial': '.pygame_env',
+    'BinaryMathEnvCUDA': '.cuda',
+    'BinaryMathEnvCUDAOptimized': '.cuda_optimized',
 }
 
 

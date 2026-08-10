@@ -1,28 +1,26 @@
-"""Agente de Monte Carlo on-policy (first-visit) para BinaryMathEnv.
+"""Base tabular para agentes CPU (un episodio = un entorno, gym API).
 
-Estado = observación del entorno: [cursor_position, casillas_rellenas].
-Como ambas componentes siempre son iguales (cada paso llena una celda),
-el estado efectivo es el cursor (0..CC).
+La observación del entorno es [cursor_position, casillas_rellenas]; como cada
+paso rellena una celda, el estado efectivo es el cursor (0..CC). Las
+recompensas intermedias son 0 y la terminal llega al completar la tabla.
 
-Puesto que las recompensas intermedias son 0 y la recompensa terminal llega
-solo al final del episodio, el retorno G_t es el mismo para todos los pasos
-del episodio. Además el cursor crece estrictamente, así que ningún par (s, a)
-se repite dentro de un episodio: first-visit == every-visit.
-
-Update:  Q[s, a] += alpha * (G - Q[s, a])   para todo (s, a) visitado.
+`collect_episode` devuelve la trayectoria con la información mínima para
+cualquier update tabular: (s, a, r, s_next, a_next). MC ignora la parte TD;
+Q-learning y SARSA usan r y el siguiente valor.
 """
 
 import numpy as np
 
-from .epsilon_greedy import choose_epsilon_greedy
+from .._base import choose_epsilon_greedy, epsilon_at
 
 
-class MonteCarloAgent:
+class TabularAgentCPU:
     def __init__(
         self,
         n_states,
         n_actions,
         alpha=0.1,
+        gamma=0.95,
         epsilon_start=1.0,
         epsilon_end=0.01,
         rng_seed=None,
@@ -30,40 +28,55 @@ class MonteCarloAgent:
         self.Q = np.zeros((n_states, n_actions))
         self.N = np.zeros((n_states, n_actions), dtype=np.int64)
         self.alpha = alpha
+        self.gamma = gamma
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.rng = np.random.default_rng(rng_seed)
 
     def epsilon_at(self, episode, max_episodes):
-        """Decaimiento lineal de epsilon a lo largo del entrenamiento."""
-        if max_episodes <= 1:
-            return self.epsilon_end
-        frac = episode / (max_episodes - 1)
-        return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * frac
+        return epsilon_at(self.epsilon_start, self.epsilon_end, episode, max_episodes)
+
+    # =========================================================================
+    # Recogida de episodios
+    # =========================================================================
 
     def collect_episode(self, env, epsilon, seed):
         """Ejecuta un episodio completo con política epsilon-greedy.
 
         Returns:
-            episode: lista de (s, a).
-            total_return: recompensa terminal (las intermedias son 0).
+            trajectory: lista de (s, a, r, s_next, a_next). En el último paso
+                        a_next es None (estado terminal, Q[s_next]=0).
         """
         obs, _ = env.reset(seed=seed)
-        episode = []
+        trajectory = []
         terminated = truncated = False
-        total_return = 0.0
+        s = int(obs[0])
         while not (terminated or truncated):
-            s = int(obs[0])
             a = choose_epsilon_greedy(self.Q[s], epsilon, self.rng)
             obs, reward, terminated, truncated, _ = env.step(a)
-            episode.append((s, a))
-            total_return += float(reward)
-        return episode, total_return
+            s_next = int(obs[0])
+            if not (terminated or truncated):
+                a_next = choose_epsilon_greedy(self.Q[s_next], epsilon, self.rng)
+            else:
+                a_next = None
+            trajectory.append((s, a, float(reward), s_next, a_next))
+            s = s_next
+        return trajectory
 
-    def update(self, episode, return_):
-        for s, a in episode:
-            self.Q[s, a] += self.alpha * (return_ - self.Q[s, a])
-            self.N[s, a] += 1
+    @staticmethod
+    def episode_return(trajectory):
+        return sum(r for *_, r, _, _ in trajectory)
+
+    # =========================================================================
+    # Actualización (implementada por cada algoritmo)
+    # =========================================================================
+
+    def update(self, trajectory):
+        raise NotImplementedError
+
+    # =========================================================================
+    # Entrenamiento y evaluación
+    # =========================================================================
 
     def train(self, env, episodes, base_seed=42, on_episode=None,
               early_stop_return=None):
@@ -80,8 +93,9 @@ class MonteCarloAgent:
         stopped = False
         for ep in range(episodes):
             epsilon = self.epsilon_at(ep, episodes)
-            episode, return_ = self.collect_episode(env, epsilon, seed=base_seed + ep)
-            self.update(episode, return_)
+            trajectory = self.collect_episode(env, epsilon, seed=base_seed + ep)
+            self.update(trajectory)
+            return_ = self.episode_return(trajectory)
             returns[ep] = return_
             epsilons[ep] = epsilon
             if on_episode is not None:
@@ -102,8 +116,8 @@ class MonteCarloAgent:
         returns = np.empty(episodes)
         errors = np.empty(episodes)
         for i in range(episodes):
-            episode, return_ = self.collect_episode(env, epsilon=0.0, seed=base_seed + i)
-            returns[i] = return_
+            trajectory = self.collect_episode(env, epsilon=0.0, seed=base_seed + i)
+            returns[i] = self.episode_return(trajectory)
             metrics = getattr(env, "last_metrics", None)
             if metrics and "error_mean" in metrics:
                 errors[i] = metrics["error_mean"]

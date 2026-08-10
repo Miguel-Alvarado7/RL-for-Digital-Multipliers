@@ -1,8 +1,14 @@
 import gymnasium as gym
 import numpy as np
 import random
-from datetime import datetime
 import copy
+from pathlib import Path
+
+# Rutas por defecto del proyecto: scratch de Verilog en out/verilog/ (ignorado
+# por git) y plantilla de testbench versionada en verification/.
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+VERILOG_DIR = _REPO_ROOT / "out" / "verilog"
+TEMPLATE_PATH = _REPO_ROOT / "verification" / "testbench_template.v"
 
 
 class BinaryMathEnv(gym.Env):
@@ -62,20 +68,15 @@ class BinaryMathEnv(gym.Env):
         Recompensa: 0 durante pasos intermedios.
         Recompensa final: basada en error del circuito cuando se completa la tabla.
         """
-        # Usar rutas por defecto relativas al proyecto
-        from pathlib import Path
+        # Usar rutas por defecto relativas al proyecto (out/verilog/, gitignored)
         if arch_multiplier is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier = str(project_root / 'verilog' / 'multiplier.v')
+            arch_multiplier = str(VERILOG_DIR / 'multiplier.v')
         if arch_multipliermax is None:
-            project_root = Path(__file__).parent.parent
-            arch_multipliermax = str(project_root / 'verilog' / 'multipliermax.v')
+            arch_multipliermax = str(VERILOG_DIR / 'multipliermax.v')
         if arch_multiplier_8bit_tb is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier_8bit_tb = str(project_root / 'verilog' / 'multiplier_8bit_tb.v')
+            arch_multiplier_8bit_tb = str(VERILOG_DIR / 'multiplier_8bit_tb.v')
         if arch_simv is None:
-            project_root = Path(__file__).parent.parent
-            arch_simv = str(project_root / 'verilog' / 'simv')
+            arch_simv = str(VERILOG_DIR / 'simv')
 
         terminated = False
         truncated = False
@@ -196,20 +197,15 @@ class BinaryMathEnv(gym.Env):
         Evaluar la solución generada y calcular la recompensa final.
         Recompensa basada en: error funcional + métricas del circuito (opcional).
         """
-        # Usar rutas por defecto relativas al proyecto
-        from pathlib import Path
+        # Usar rutas por defecto relativas al proyecto (out/verilog/, gitignored)
         if arch_multiplier is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier = str(project_root / 'verilog' / 'multiplier.v')
+            arch_multiplier = str(VERILOG_DIR / 'multiplier.v')
         if arch_multipliermax is None:
-            project_root = Path(__file__).parent.parent
-            arch_multipliermax = str(project_root / 'verilog' / 'multipliermax.v')
+            arch_multipliermax = str(VERILOG_DIR / 'multipliermax.v')
         if arch_multiplier_8bit_tb is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier_8bit_tb = str(project_root / 'verilog' / 'multiplier_8bit_tb.v')
+            arch_multiplier_8bit_tb = str(VERILOG_DIR / 'multiplier_8bit_tb.v')
         if arch_simv is None:
-            project_root = Path(__file__).parent.parent
-            arch_simv = str(project_root / 'verilog' / 'simv')
+            arch_simv = str(VERILOG_DIR / 'simv')
 
         terminated = True
         try:
@@ -308,17 +304,13 @@ class BinaryMathEnv(gym.Env):
         """
         import subprocess
 
-        # Usar rutas por defecto relativas al proyecto
-        from pathlib import Path
+        # Usar rutas por defecto relativas al proyecto (out/verilog/, gitignored)
         if arch_multiplier is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier = str(project_root / 'verilog' / 'multiplier.v')
+            arch_multiplier = str(VERILOG_DIR / 'multiplier.v')
         if arch_multiplier_8bit_tb is None:
-            project_root = Path(__file__).parent.parent
-            arch_multiplier_8bit_tb = str(project_root / 'verilog' / 'multiplier_8bit_tb.v')
+            arch_multiplier_8bit_tb = str(VERILOG_DIR / 'multiplier_8bit_tb.v')
         if arch_simv is None:
-            project_root = Path(__file__).parent.parent
-            arch_simv = str(project_root / 'verilog' / 'simv')
+            arch_simv = str(VERILOG_DIR / 'simv')
 
         # Remodelar grid y obtener productos únicos SIN DUPLICADOS
         suma_grid = np.array(self.suma_grid).reshape(self.height, 2 * self.Bits)
@@ -405,10 +397,7 @@ module multiplier (
 
         # Leer y modificar testbench
         try:
-            # Usar ruta relativa al directorio del proyecto
-            from pathlib import Path
-            project_root = Path(__file__).parent.parent
-            template_path = project_root / 'verilog' / 'testbench_template.v'
+            template_path = TEMPLATE_PATH
 
             with open(template_path, 'r') as file:
                 content = file.read()

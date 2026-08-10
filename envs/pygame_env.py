@@ -3,7 +3,7 @@ import numpy as np
 import pygame
 import random
 import copy
-from .env_base import BinaryMathEnv
+from .base import BinaryMathEnv
 
 
 class BinaryMathEnvSecuencial(BinaryMathEnv):

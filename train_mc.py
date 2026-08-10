@@ -16,10 +16,10 @@ import os
 
 import numpy as np
 
-from Environment.Environment import BinaryMathEnv
-from agents.montecarlo import MonteCarloAgent
+from envs import BinaryMathEnv
+from agents.cpu.montecarlo import MonteCarloAgent
 
-OUT_DIR = "out"
+OUT_DIR = "out/montecarlo"
 
 
 def random_baseline(env, n_episodes, base_seed):
