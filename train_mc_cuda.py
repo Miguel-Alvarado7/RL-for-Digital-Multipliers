@@ -18,7 +18,7 @@ Un batch es un solo GEMM: en GPU n_envs=64 y n_envs=4096 tardan lo MISMO (la
 GPU está ociosa por debajo), así que valores pequeños solo desperdician
 throughput. Si hay OOM, chunk_size se auto-ajusta a la baja.
 
-Artifacts en out/montecarlo_cuda/:
+Artifacts en out/montecarlo_cuda/bits{N}/ (N = número de bits):
     returns_cuda.csv        retornos por episodio (MC y baseline)
     Q_cuda.npy              tabla Q aprendida
     learning_curve_cuda.png curva de aprendizaje vs baseline aleatorio
@@ -39,7 +39,7 @@ from training.artifacts import TopK, save_topk, save_q, save_returns
 from training.baseline import random_baseline_cuda
 from training.plot import learning_curve
 
-OUT_DIR = "out/montecarlo_cuda"
+OUT_DIR = "out/montecarlo_cuda/bits{N}"
 
 
 def main():
@@ -149,7 +149,8 @@ def main():
 
     args = parser.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    out_dir = OUT_DIR.format(N=args.bits)
+    os.makedirs(out_dir, exist_ok=True)
 
     # =========================================================================
     # Entorno CUDA batched
@@ -247,18 +248,18 @@ def main():
     # =========================================================================
     # Artefactos
     # =========================================================================
-    save_q(os.path.join(OUT_DIR, "Q_cuda.npy"), agent.Q)
-    save_returns(os.path.join(OUT_DIR, "returns_cuda.csv"), records)
+    save_q(os.path.join(out_dir, "Q_cuda.npy"), agent.Q)
+    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records)
 
     save_topk(
-        topk, OUT_DIR, args.bits, args.height, "best_multiplier_cuda",
+        topk, out_dir, args.bits, args.height, "best_multiplier_cuda",
         grid_from_key=lambda key: env.grid_to_state(list(key))['suma_grid'],
     )
 
     if not args.no_plot:
         learning_curve(
             np.array([r[2] for r in records]), baseline, eval_returns.mean(),
-            os.path.join(OUT_DIR, "learning_curve_cuda.png"),
+            os.path.join(out_dir, "learning_curve_cuda.png"),
             title="Monte Carlo on-policy batched - BinaryMathEnvCUDAOptimized",
             ylabel="Retorno (reward CUDA, [-10, 0])",
             series_label="MC", optimum=0.0, optimum_label="Óptimo (reward 0)",
