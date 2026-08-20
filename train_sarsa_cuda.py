@@ -3,7 +3,7 @@
 Uso:
     python train_sarsa_cuda.py [--bits 2] [--height 2] [--n-envs 512]
                                [--episodes 100000] [--alpha 0.1] [--gamma 0.95]
-                               [--seed 42] [--device cuda] [--no-plot]
+                               [--n-steps 1] [--seed 42] [--device cuda] [--no-plot]
 
 Artifacts en out/sarsa_cuda/:
     returns_cuda.csv            retornos por episodio
@@ -39,6 +39,9 @@ def main():
     parser.add_argument("--baseline-batches", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=0.1)
     parser.add_argument("--gamma", type=float, default=0.95)
+    parser.add_argument("--n-steps", type=int, default=1,
+                        help="Número de pasos de lookahead para el retorno "
+                             "n-step SARSA (default: 1 = SARSA(0)).")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu"])
@@ -82,6 +85,7 @@ def main():
         gamma=args.gamma,
         device=args.device,
         seed=args.seed + 2,
+        n_steps=args.n_steps,
     )
 
     best_return = -np.inf

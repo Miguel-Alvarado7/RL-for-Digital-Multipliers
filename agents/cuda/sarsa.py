@@ -1,7 +1,12 @@
-"""Agente de SARSA (on-policy TD) VECTORIZADO para entornos CUDA.
+"""Agente de SARSA (on-policy TD) VECTORIZADO para entornos CUDA, con n-step.
 
-Update:  Q[s, a] += alpha * (r_t + gamma * Q[s_{t+1}, a'] - Q[s, a]), con a'
-la acción realmente tomada en el siguiente paso por la política ε-greedy.
+Update:  Q[s, a] += alpha * (G_t^(n) - Q[s, a]), con el retorno n-step
+
+    G_t^(n) = sum_{k=0}^{n-1} gamma^k r_{t+k} + gamma^n Q[s_{t+n}, a_{t+n}],
+
+donde a_{t+n} es la acción realmente tomada en el paso t+n por la política
+ε-greedy. Con n_steps=1 se reduce a SARSA(0); con n_steps >= CC se aproxima a
+Monte Carlo (retorno completo del episodio).
 
 Recompensa POR PASO con shaping potencial de la rejilla:
     r_t = R(partial_t) - R(partial_{t-1}),   R(partial_{-1}) = R(vacío),
@@ -33,6 +38,16 @@ from .base import TabularAgentCUDA
 
 
 class SarsaAgentCUDA(TabularAgentCUDA):
+    def __init__(self, n_states, n_actions, alpha=0.1, gamma=0.95,
+                 epsilon_start=1.0, epsilon_end=0.01, device="cuda", seed=None,
+                 n_steps=1):
+        super().__init__(
+            n_states=n_states, n_actions=n_actions, alpha=alpha, gamma=gamma,
+            epsilon_start=epsilon_start, epsilon_end=epsilon_end,
+            device=device, seed=seed,
+        )
+        self.n_steps = int(n_steps)
+
     def collect_batch(self, env, epsilon):
         """Como la base, pero además materializa la recompensa por paso.
 
@@ -80,20 +95,32 @@ class SarsaAgentCUDA(TabularAgentCUDA):
             rewards = self.per_step_rewards(actions, returns)
 
         T, n = states.shape
+        n_steps = self.n_steps
 
+        # Retorno n-step descontado: sum_{k=0}^{n-1} gamma^k * r_{t+k}.
+        # Se rellena con ceros más allá del final del episodio.
+        padded = torch.cat([rewards, torch.zeros(n_steps, n, device=self.device)])
+        G = torch.zeros(T, n, device=self.device)
+        for k in range(n_steps):
+            G += (self.gamma ** k) * padded[k:k + T]
+
+        # Bootstrap: gamma^n * Q[s_{t+n}, a_{t+n}]. Si t+n >= T, el estado es
+        # el terminal (Q[CC, ·] = 0) y la acción es un dummy sin efecto.
+        # `pad` acota las filas terminales a T cuando n_steps > T (episodio
+        # más corto que el lookahead: degenera a Monte Carlo).
+        pad = min(n_steps, T)
         next_states = torch.cat([
-            states[1:],
-            torch.full((1, n), self.Q.shape[0] - 1,
+            states[n_steps:],
+            torch.full((pad, n), self.Q.shape[0] - 1,
                        dtype=torch.int64, device=self.device),
         ])
-        # La última fila de next_actions es irrelevante: next_states[T-1] es el
-        # estado terminal (Q[CC, ·] = 0), así que su valor no entra en el target.
         next_actions = torch.cat([
-            actions[1:],
-            torch.zeros(1, n, dtype=torch.int64, device=self.device),
+            actions[n_steps:],
+            torch.zeros(pad, n, dtype=torch.int64, device=self.device),
         ])
-        next_val = self.Q[next_states, next_actions]  # (T, n)
-        target = rewards + self.gamma * next_val
+        bootstrap = (self.gamma ** n_steps) * self.Q[next_states, next_actions]
+
+        target = G + bootstrap
 
         s_flat = states.reshape(-1)
         a_flat = actions.reshape(-1)
