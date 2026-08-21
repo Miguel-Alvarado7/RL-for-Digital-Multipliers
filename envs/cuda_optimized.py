@@ -52,6 +52,8 @@ class BinaryMathEnvCUDAOptimized:
         n_envs: int = 256,
         device: str = 'cuda',
         chunk_size: int = None,
+        error_mode: str = 'wrap',
+        area_lambda: float = 0.0,
     ):
         """
         Args:
@@ -63,7 +65,20 @@ class BinaryMathEnvCUDAOptimized:
             chunk_size: Pares (A,B) por chunk de evaluación. None => auto, se
                         elige para que el tensor de productos (n_envs, chunk)
                         quepa en ~PRODUCT_BUDGET_MB. Un entero lo fuerza.
+            error_mode: 'wrap' (default, comportamiento histórico) envuelve el
+                        error módulo 2^max_bits, así que un circuito que se
+                        pasa por mucho puntúa como si se pasara por poco;
+                        'saturate' lo satura en el máximo (deja de premiar el
+                        desbordamiento, pero aplana la zona mala);
+                        'linear' usa el error real sin envolver ni aplanar.
+            area_lambda: Penalización por término usado, restada del reward.
+                        0 = desactivada (comportamiento histórico).
         """
+        if error_mode not in ('wrap', 'saturate', 'linear'):
+            raise ValueError(
+                f"error_mode debe ser 'wrap', 'saturate' o 'linear', no {error_mode!r}")
+        self.error_mode = error_mode
+        self.area_lambda = float(area_lambda)
         self.Bits = Bits
         self.height = height
         self.n_envs = n_envs
@@ -359,7 +374,9 @@ class BinaryMathEnvCUDAOptimized:
             grids: (n_envs, CC) int — índices de acción, -1 = celda vacía.
 
         Returns:
-            (n_envs, n_actions) float32
+            presence: (n_envs, n_actions) float32 — pesos plegados.
+            terms:    (n_envs,) float32 — nº de términos distintos != '0'
+                      sumados sobre columnas. Proxy de área del circuito.
         """
         n_envs = grids.shape[0]
         g = grids.view(n_envs, self.height, self.grid_size).long()
@@ -372,7 +389,11 @@ class BinaryMathEnvCUDAOptimized:
         presence.scatter_(2, g.transpose(1, 2), 1.0)
         presence = presence[:, :, :self.n_actions]
 
-        return torch.einsum('eca,c->ea', presence, self._shift_f32)
+        # Área: términos distintos por columna, sin contar la acción '0'
+        # (índice 0), que no aporta nada al circuito.
+        terms = presence[:, :, 1:].sum(dim=(1, 2))
+
+        return torch.einsum('eca,c->ea', presence, self._shift_f32), terms
 
     def _compute_products_chunked(
         self, grids: torch.Tensor
@@ -398,7 +419,7 @@ class BinaryMathEnvCUDAOptimized:
             (n_envs,) float32 - rewards normalizados
         """
         n_envs = grids.shape[0]
-        presence = self._grid_presence(grids)          # (n_envs, n_actions)
+        presence, terms = self._grid_presence(grids)   # (n_envs, n_actions)
 
         prev_tf32 = torch.backends.cuda.matmul.allow_tf32
         torch.backends.cuda.matmul.allow_tf32 = False
@@ -411,8 +432,21 @@ class BinaryMathEnvCUDAOptimized:
                 products = presence @ action_vals.T             # (n_envs, chunk)
 
                 error = (products - self._true_P[lo:hi].unsqueeze(0)).abs()
-                # Equivalente exacto de la suma bit-ponderada del original.
-                normalized = torch.remainder(error.floor_(), self._err_mod)
+                error.floor_()
+                if self.error_mode == 'linear':
+                    # Error real, sin envolver ni aplanar: monotono en todo el
+                    # rango, asi que nunca premia pasarse y conserva gradiente
+                    # tambien en la zona mala (donde 'saturate' es una meseta).
+                    normalized = error
+                elif self.error_mode == 'saturate':
+                    # Un error mayor que el maximo representable es, como
+                    # minimo, tan malo como el maximo: se satura en vez de
+                    # envolverse.
+                    normalized = error.clamp(max=self._err_denom)
+                else:
+                    # 'wrap': equivalente exacto de la suma bit-ponderada
+                    # del entorno original (error mod 2^max_bits).
+                    normalized = torch.remainder(error, self._err_mod)
                 error_sums += normalized.sum(dim=1) / self._err_denom
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev_tf32
@@ -420,7 +454,53 @@ class BinaryMathEnvCUDAOptimized:
         avg_error = error_sums / self.n_test_cases
         # El original calculaba log(exp(l*avg_error))/l, que es la identidad
         # (y desborda a inf si l*avg_error > 709). Se aplica directamente.
-        return (-10.0 * avg_error).clamp(min=-100.0)
+        reward = (-10.0 * avg_error).clamp(min=-100.0)
+        if self.area_lambda:
+            # Penalizacion de area: sin esto nada empuja al agente a usar
+            # menos terminos, y 'height' acaba haciendo de proxy de area.
+            reward = reward - self.area_lambda * terms
+        return reward
+
+    def true_metrics(self, grids: torch.Tensor):
+        """Métricas honestas de un circuito, independientes del reward.
+
+        No envuelve el error ni aplica penalización de área, así que sirve
+        como patrón neutral para comparar funciones de reward distintas.
+
+        Args:
+            grids: (n, CC) int — índices de acción.
+
+        Returns:
+            mae:   (n,) float32 — error absoluto medio sobre todos los pares.
+            terms: (n,) float32 — términos distintos != '0' (proxy de área).
+            exact: (n,) float32 — fracción de pares calculados exactamente.
+            mred:  (n,) float32 — error relativo medio (|err|/A·B), promediado
+                   solo sobre los pares con A·B > 0 (el estándar en
+                   computación aproximada; A·B = 0 lo haría indefinido).
+        """
+        presence, terms = self._grid_presence(grids.long())
+        prev = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            n = grids.shape[0]
+            err_sum = torch.zeros(n, device=self.device)
+            exact = torch.zeros(n, device=self.device)
+            rel_sum = torch.zeros(n, device=self.device)
+            n_nz = 0
+            for lo in range(0, self.n_test_cases, self.chunk_size):
+                hi = min(lo + self.chunk_size, self.n_test_cases)
+                T = self._true_P[lo:hi]
+                P = presence @ self._action_vals_for(lo, hi).T
+                e = (P - T.unsqueeze(0)).abs()
+                err_sum += e.sum(dim=1)
+                exact += (e == 0).float().sum(dim=1)
+                nz = T > 0
+                rel_sum += (e[:, nz] / T[nz]).sum(dim=1)
+                n_nz += int(nz.sum())
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = prev
+        return (err_sum / self.n_test_cases, terms,
+                exact / self.n_test_cases, rel_sum / max(n_nz, 1))
 
     def _evaluate_batch(self, env_mask: torch.Tensor) -> torch.Tensor:
         """Evalúa entornos enmascarados usando chunking."""
