@@ -12,7 +12,11 @@ env/
 .idea/
 
 # Experiment outputs
-out/
+# Experiment outputs: se versionan los artefactos pequenos (circuitos, curvas,
+# tablas Q) pero NUNCA los returns_*.csv, que son una fila por episodio y
+# pesan GB. 'out/**' ignora ficheros; '!out/**/' permite descender por los
+# directorios (si no, las negaciones de dentro no se aplican).
+out/**
 *.npy
 *.csv
 
@@ -28,3 +32,10 @@ ref_simv
 # OS
 Thumbs.db
 .DS_Store
+
+# Negaciones al final: en .gitignore gana la ULTIMA regla que casa, asi que
+# estas deben ir despues de patrones globales como *.npy.
+!out/**/
+!out/**/*.v
+!out/**/*.png
+!out/**/*.npy
