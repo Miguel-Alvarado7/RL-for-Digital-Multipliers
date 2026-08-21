@@ -5,7 +5,7 @@ Uso:
                                [--episodes 100000] [--alpha 0.1] [--gamma 0.95]
                                [--n-steps 1] [--seed 42] [--device cuda] [--no-plot]
 
-Artifacts en out/sarsa_cuda/:
+Artifacts en out/sarsa_cuda/bits{N}_nsteps{S}/ (N = bits, S = n_steps):
     returns_cuda.csv            retornos por episodio
     Q_cuda.npy                  tabla Q aprendida
     learning_curve_cuda.png     curva de aprendizaje vs baseline aleatorio
@@ -25,7 +25,7 @@ from training.baseline import random_baseline_cuda
 from training.artifacts import TopK, save_q, save_returns, save_topk
 from training.plot import learning_curve
 
-OUT_DIR = "out/sarsa_cuda"
+OUT_DIR = "out/sarsa_cuda/bits{N}_nsteps{S}"
 
 
 def main():
@@ -52,7 +52,8 @@ def main():
     )
     args = parser.parse_args()
 
-    os.makedirs(OUT_DIR, exist_ok=True)
+    out_dir = OUT_DIR.format(N=args.bits, S=args.n_steps)
+    os.makedirs(out_dir, exist_ok=True)
 
     env = BinaryMathEnvCUDAOptimized(
         Bits=args.bits,
@@ -134,14 +135,14 @@ def main():
     print(f"Eval greedy:    return={eval_returns.mean():.3f}")
     print(f"SARSA vs baseline: {eval_returns.mean() - baseline.mean():+.3f}")
 
-    save_q(os.path.join(OUT_DIR, "Q_cuda.npy"), agent.Q)
-    save_returns(os.path.join(OUT_DIR, "returns_cuda.csv"), records)
-    save_topk(topk, OUT_DIR, args.bits, args.height, "best_multiplier_cuda",
+    save_q(os.path.join(out_dir, "Q_cuda.npy"), agent.Q)
+    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records)
+    save_topk(topk, out_dir, args.bits, args.height, "best_multiplier_cuda",
               grid_from_key=lambda key: env.grid_to_state(list(key))["suma_grid"])
 
     if not args.no_plot:
         learning_curve([r[2] for r in records], baseline, eval_returns.mean(),
-                       os.path.join(OUT_DIR, "learning_curve_cuda.png"),
+                       os.path.join(out_dir, "learning_curve_cuda.png"),
                        title="SARSA on-policy batched - BinaryMathEnvCUDAOptimized",
                        ylabel="Retorno (reward CUDA, [-10, 0])",
                        series_label="SARSA",
