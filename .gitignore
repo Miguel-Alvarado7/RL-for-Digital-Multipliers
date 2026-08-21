@@ -16,9 +16,6 @@ env/
 # tablas Q) pero NUNCA los returns_*.csv, que son una fila por episodio y
 # pesan GB. 'out/**' ignora ficheros; '!out/**/' permite descender por los
 # directorios (si no, las negaciones de dentro no se aplican).
-out/**
-*.npy
-*.csv
 
 # Verilog build artifacts (keep template + source)
 *.vcd
