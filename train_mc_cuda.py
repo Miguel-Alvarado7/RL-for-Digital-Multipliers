@@ -18,7 +18,7 @@ Un batch es un solo GEMM: en GPU n_envs=64 y n_envs=4096 tardan lo MISMO (la
 GPU está ociosa por debajo), así que valores pequeños solo desperdician
 throughput. Si hay OOM, chunk_size se auto-ajusta a la baja.
 
-Artifacts en out/montecarlo_cuda/bits{N}/ (N = número de bits):
+Artifacts en out/montecarlo_cuda/bits<N>/ (N = --bits, un directorio por ancho):
     returns_cuda.csv        retornos por episodio (MC y baseline)
     Q_cuda.npy              tabla Q aprendida
     learning_curve_cuda.png curva de aprendizaje vs baseline aleatorio
