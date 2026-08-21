@@ -35,7 +35,7 @@ import torch
 from envs import BinaryMathEnv
 from envs import BinaryMathEnvCUDAOptimized
 from agents.cuda.montecarlo import MonteCarloAgentCUDA
-from training.artifacts import TopK, save_topk, save_q, save_returns
+from training.artifacts import TopK, save_topk, save_q, save_returns, topk_add_batch
 from training.baseline import random_baseline_cuda
 from training.plot import learning_curve
 
@@ -206,9 +206,7 @@ def main():
         # (snapshot antes de la greedy; env.suma_grid pudo haber sido
         # sobrescrito por la corrida greedy).
         if batch_grids is not None:
-            ret_cpu = returns_tensor.cpu()
-            for i in range(env.n_envs):
-                topk.add(ret_cpu[i].item(), tuple(batch_grids[i].tolist()))
+            topk_add_batch(topk, returns_tensor, batch_grids)
         if b % 100 == 0 or b == n_batches - 1:
             # La media solo se materializa cuando se va a imprimir: cada
             # .item() sincroniza CPU<->GPU.
@@ -249,7 +247,8 @@ def main():
     # Artefactos
     # =========================================================================
     save_q(os.path.join(out_dir, "Q_cuda.npy"), agent.Q)
-    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records)
+    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records,
+                 n_envs=env.n_envs)
 
     save_topk(
         topk, out_dir, args.bits, args.height, "best_multiplier_cuda",

@@ -22,7 +22,7 @@ import torch
 from envs import BinaryMathEnvCUDAOptimized
 from agents.cuda.qlearning import QLearningAgentCUDA
 from training.baseline import random_baseline_cuda
-from training.artifacts import TopK, save_q, save_returns, save_topk
+from training.artifacts import TopK, save_q, save_returns, save_topk, topk_add_batch
 from training.plot import learning_curve
 
 OUT_DIR = "out/qlearning_cuda/bits{N}"
@@ -99,9 +99,7 @@ def main():
         # Top-5 con las rejillas del batch de comportamiento (snapshot antes
         # de la greedy; env.suma_grid pudo haber sido sobrescrito).
         if batch_grids is not None:
-            ret_cpu = returns_tensor.cpu()
-            for i in range(env.n_envs):
-                topk.add(ret_cpu[i].item(), tuple(batch_grids[i].tolist()))
+            topk_add_batch(topk, returns_tensor, batch_grids)
         if b % 100 == 0 or b == n_batches - 1:
             print(f"batch={b:4d}/{n_batches}  eps={epsilon:.3f}  "
                   f"mean={returns_tensor.mean().item():8.3f}  "
@@ -132,7 +130,8 @@ def main():
     print(f"Q-learning vs baseline: {eval_returns.mean() - baseline.mean():+.3f}")
 
     save_q(os.path.join(out_dir, "Q_cuda.npy"), agent.Q)
-    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records)
+    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records,
+                 n_envs=env.n_envs)
     save_topk(topk, out_dir, args.bits, args.height, "best_multiplier_cuda",
               grid_from_key=lambda key: env.grid_to_state(list(key))["suma_grid"])
 
