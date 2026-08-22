@@ -141,8 +141,12 @@ class TabularAgentCUDA:
     # Entrenamiento y evaluación
     # =========================================================================
 
+    #: Columnas de la matriz de estadisticas por batch que devuelve train().
+    BATCH_STAT_COLUMNS = ("batch", "episode_start", "epsilon", "mean", "std",
+                          "min", "max", "p25", "p50", "p75")
+
     def train(self, env, n_batches, on_batch=None, early_stop_return=0.0,
-              greedy_eval_every=10):
+              greedy_eval_every=10, checkpoint_every=0, on_checkpoint=None):
         """Entrena por `n_batches` batches. Cada batch = n_envs episodios.
 
         Criterio de parada HÍBRIDO (política greedy, no episodio suelto):
@@ -169,16 +173,31 @@ class TabularAgentCUDA:
                                En CUDA el óptimo es 0 (circuito perfecto).
             greedy_eval_every: Cada cuántos batches se evalúa la política greedy
                                (0 desactiva el monitoreo periódico).
+            checkpoint_every:  Cada cuántos batches se llama a `on_checkpoint`
+                               (0 lo desactiva).
+            on_checkpoint:     Callback opcional on_checkpoint(n_batches_hechos,
+                               stats_hasta_ahora) para volcar estado parcial.
 
         Returns:
-            records: lista de (episodio_global, epsilon, retorno) por episodio real.
+            stats:   (batches_ejecutados, 10) float64 — una fila POR BATCH, con
+                     las columnas de BATCH_STAT_COLUMNS.
             stopped: True si se detuvo porque la política greedy quedó confirmada.
         """
         stopped = False
         threshold = early_stop_return if early_stop_return is not None else 0.0
-        # Los retornos se acumulan en GPU y se bajan UNA vez al final: un
-        # .cpu() por batch sincroniza y serializa el pipeline sin necesidad.
-        all_returns, all_eps = [], []
+
+        # Estadisticas POR BATCH, calculadas donde nacen los datos. Antes se
+        # acumulaba un retorno por episodio y se agregaba al guardar: con 50M
+        # episodios eso eran ~50M tuplas de Python vivas a la vez (medido:
+        # ~162 MB de RSS por millon de episodios, o sea ~9 GB al final de una
+        # corrida de 50M). Asi el coste es O(n_batches), no O(episodios).
+        #
+        # En float64 a proposito: la ruta antigua pasaba por float() de Python
+        # y np.array(dtype=float), de modo que las estadisticas salian en
+        # float64. Calcularlas en el float32 del tensor daria numeros distintos.
+        n_envs = env.n_envs
+        stats = np.empty((n_batches, len(self.BATCH_STAT_COLUMNS)), dtype=np.float64)
+        n_done = 0
 
         for b in range(n_batches):
             epsilon = self.epsilon_at(b, n_batches)
@@ -190,8 +209,10 @@ class TabularAgentCUDA:
             # greedy posterior sobrescribiría.
             batch_grids = actions.T
 
-            all_returns.append(returns)
-            all_eps.append(epsilon)
+            r = returns.double().cpu().numpy()
+            stats[b] = (b, b * n_envs, epsilon, r.mean(), r.std(),
+                        r.min(), r.max(), *np.percentile(r, [25, 50, 75]))
+            n_done = b + 1
 
             # ¿Hay candidato (un episodio alcanzó el umbral) o toca monitoreo?
             candidate = early_stop_return is not None and \
@@ -214,13 +235,14 @@ class TabularAgentCUDA:
             if on_batch is not None:
                 on_batch(b, epsilon, returns, greedy_info, batch_grids)
 
+            if (checkpoint_every and on_checkpoint is not None
+                    and n_done % checkpoint_every == 0):
+                on_checkpoint(n_done, stats[:n_done])
+
             if stopped:
                 break
 
-        n = env.n_envs
-        flat = torch.cat(all_returns).cpu().numpy()
-        records = [(i, all_eps[i // n], float(r)) for i, r in enumerate(flat)]
-        return records, stopped
+        return stats[:n_done], stopped
 
     def greedy_return(self, env):
         """Retorno de la política greedy (argmax Q), evaluando UNA trayectoria.

@@ -1,5 +1,6 @@
 """Artefactos por agente: TopK de circuitos, export Verilog, Q y returns."""
 
+import json
 import os
 
 import numpy as np
@@ -109,7 +110,63 @@ def save_q(path, q):
     """Guarda la tabla Q (numpy o torch, CPU/GPU) en `path`."""
     if hasattr(q, "detach"):
         q = q.detach().cpu().numpy()
-    np.save(path, np.asarray(q))
+    arr = np.asarray(q)
+    # np.save anade .npy si falta; con el temporal hay que fijarlo a mano para
+    # que os.replace mueva el fichero que de verdad se escribio.
+    _atomic_write(path, lambda t: np.save(t, arr, allow_pickle=False)
+                  if t.endswith(".npy") else np.save(open(t, "wb"), arr))
+
+
+#: Ficheros que escribe on_checkpoint; se borran al terminar bien la corrida.
+CHECKPOINT_FILES = ("Q_cuda_partial.npy", "returns_cuda_partial.csv",
+                    "topk_partial.json")
+
+
+def clear_checkpoints(out_dir):
+    """Borra los checkpoints una vez escritos los artefactos definitivos.
+
+    Llamar SIEMPRE despues de guardar los definitivos, nunca antes: si el
+    proceso muere durante el volcado final, el checkpoint sigue siendo la
+    ultima copia buena.
+
+    Sin esto quedaria un returns_cuda_partial.csv junto al definitivo, con
+    MENOS batches (llega solo hasta el ultimo checkpoint) y facil de confundir
+    con un resultado.
+    """
+    for name in CHECKPOINT_FILES:
+        path = os.path.join(out_dir, name)
+        if os.path.exists(path):
+            os.remove(path)
+
+
+_BATCH_HEADER = "batch,episode_start,epsilon,mean,std,min,max,p25,p50,p75"
+
+
+def _atomic_write(path, write_fn):
+    """Escribe via fichero temporal y os.replace.
+
+    Un checkpoint a medio escribir es peor que no tenerlo: si el proceso muere
+    durante el volcado, el fichero anterior sigue intacto porque el rename es
+    atomico dentro del mismo sistema de ficheros.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        write_fn(tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def save_topk_state(topk, path):
+    """Vuelca el TopK a JSON (retorno + rejilla por entrada).
+
+    Los circuitos son el entregable real: un checkpoint que guarda Q y la curva
+    pero no las rejillas deja sin lo unico que no se puede recalcular.
+    """
+    data = [{"return": float(r), "grid": list(k)} for r, k in topk.items]
+    _atomic_write(path, lambda t: open(t, "w").write(json.dumps(data)))
 
 
 def save_returns(path, records, n_envs=None, per_episode=False):
@@ -133,7 +190,15 @@ def save_returns(path, records, n_envs=None, per_episode=False):
         n_envs:      Episodios por batch. Si es None se escribe por episodio.
         per_episode: True fuerza el formato antiguo (una fila por episodio).
     """
-    data = np.array(records, dtype=float)
+    data = np.asarray(records, dtype=float)
+
+    # Ruta rapida: train() ya devuelve (n_batches, 10) agregado por batch, con
+    # las mismas columnas y en el mismo orden que produciria la ruta larga.
+    if data.ndim == 2 and data.shape[1] == len(_BATCH_HEADER.split(",")):
+        _atomic_write(path, lambda t: np.savetxt(
+            t, data, delimiter=",", header=_BATCH_HEADER, comments="", fmt="%.6g"))
+        return
+
     if per_episode or not n_envs:
         header = "episode,epsilon,return"
         np.savetxt(path, data, delimiter=",", header=header, comments="")
@@ -158,5 +223,5 @@ def save_returns(path, records, n_envs=None, per_episode=False):
         ret.min(axis=1), ret.max(axis=1),
         p25, p50, p75,
     ])
-    header = ("batch,episode_start,epsilon,mean,std,min,max,p25,p50,p75")
-    np.savetxt(path, out, delimiter=",", header=header, comments="", fmt="%.6g")
+    _atomic_write(path, lambda t: np.savetxt(
+        t, out, delimiter=",", header=_BATCH_HEADER, comments="", fmt="%.6g"))

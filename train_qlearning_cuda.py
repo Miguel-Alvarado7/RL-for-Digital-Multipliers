@@ -22,7 +22,8 @@ import torch
 from envs import BinaryMathEnvCUDAOptimized
 from agents.cuda.qlearning import QLearningAgentCUDA
 from training.baseline import random_baseline_cuda
-from training.artifacts import TopK, save_q, save_returns, save_topk, topk_add_batch
+from training.artifacts import (TopK, clear_checkpoints, save_q, save_returns,
+                                save_topk, save_topk_state, topk_add_batch)
 from training.plot import learning_curve
 
 OUT_DIR = "out/qlearning_cuda/bits{N}"
@@ -47,6 +48,36 @@ def main():
         "--early-stop", type=str, default="0.0",
         help="Umbral de early stop (default: 0.0). 'none'/'off' lo desactiva.",
     )
+    # --checkpoint-every: cada cuantos batches se vuelca estado parcial.
+    #   Una corrida larga que revienta al 95% no deja nada; con esto deja una
+    #   tabla Q, la curva hasta ese punto y los mejores circuitos.
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=5000,
+        help="Volcar estado parcial cada N batches (default: 5000, 0 desactiva).",
+    )
+
+    # --quiet: reduce la salida por terminal. El monitoreo greedy periodico
+    #   imprime una linea cada `greedy_eval_every` batches: con 97k batches son
+    #   ~9.800 lineas por corrida, diez veces mas que las de progreso. Su unico
+    #   efecto es ese printout (greedy_info no se usa para nada mas), asi que
+    #   con --quiet se salta tambien el computo, ahorrando una sincronizacion
+    #   CPU<->GPU por evaluacion.
+    #
+    #   El early stop NO se ve afectado: cuando un episodio alcanza el umbral
+    #   sigue disparandose la corrida greedy de confirmacion, y esa linea si se
+    #   imprime, porque es rara y significativa.
+    parser.add_argument(
+        "--quiet", action="store_true",
+        help="Omite el monitoreo greedy periodico (y su computo). No afecta "
+             "al early stop ni a los artefactos.",
+    )
+
+    # --log-every: cada cuantos batches se imprime la linea de progreso.
+    parser.add_argument(
+        "--log-every", type=int, default=100,
+        help="Imprimir progreso cada N batches (default: 100, 0 lo desactiva).",
+    )
+
     args = parser.parse_args()
 
     out_dir = OUT_DIR.format(N=args.bits)
@@ -100,7 +131,8 @@ def main():
         # de la greedy; env.suma_grid pudo haber sido sobrescrito).
         if batch_grids is not None:
             topk_add_batch(topk, returns_tensor, batch_grids)
-        if b % 100 == 0 or b == n_batches - 1:
+        if args.log_every > 0 and (b % args.log_every == 0
+                                   or b == n_batches - 1):
             print(f"batch={b:4d}/{n_batches}  eps={epsilon:.3f}  "
                   f"mean={returns_tensor.mean().item():8.3f}  "
                   f"best={best_return:8.3f}")
@@ -111,15 +143,23 @@ def main():
                   f"candidato={'si' if greedy_info['candidate'] else 'no'}  "
                   f"estado={state}")
 
+    def on_checkpoint(n_done, stats_so_far):
+        """Vuelca estado parcial. Escritura atomica: ver _atomic_write."""
+        save_q(os.path.join(out_dir, "Q_cuda_partial.npy"), agent.Q)
+        save_returns(os.path.join(out_dir, "returns_cuda_partial.csv"), stats_so_far)
+        save_topk_state(topk, os.path.join(out_dir, "topk_partial.json"))
+        print(f"    [checkpoint] batch={n_done}  -> {out_dir}")
+
     early_stop_val = None if args.early_stop.strip().lower() in ("none", "off") \
         else float(args.early_stop)
 
-    records, stopped = agent.train(
+    stats, stopped = agent.train(
         env, n_batches, on_batch=on_batch, early_stop_return=early_stop_val,
-        greedy_eval_every=10,
+        greedy_eval_every=0 if args.quiet else 10,
+        checkpoint_every=args.checkpoint_every, on_checkpoint=on_checkpoint,
     )
 
-    print(f"Batches ejecutados: {len(records) // env.n_envs}  "
+    print(f"Batches ejecutados: {len(stats)}  "
           f"(early_stop_politica_greedy={'si' if stopped else 'no'})")
 
     eval_returns = agent.evaluate(env)
@@ -130,17 +170,22 @@ def main():
     print(f"Q-learning vs baseline: {eval_returns.mean() - baseline.mean():+.3f}")
 
     save_q(os.path.join(out_dir, "Q_cuda.npy"), agent.Q)
-    save_returns(os.path.join(out_dir, "returns_cuda.csv"), records,
-                 n_envs=env.n_envs)
+    save_returns(os.path.join(out_dir, "returns_cuda.csv"), stats)
     save_topk(topk, out_dir, args.bits, args.height, "best_multiplier_cuda",
               grid_from_key=lambda key: env.grid_to_state(list(key))["suma_grid"])
 
+    # Los artefactos definitivos ya estan en disco, asi que los checkpoints
+    # sobran. Se borra DESPUES de guardarlos: si el proceso muriera durante el
+    # volcado final, el checkpoint seguiria siendo la ultima copia buena.
+    clear_checkpoints(out_dir)
+
     if not args.no_plot:
-        learning_curve([r[2] for r in records], baseline, eval_returns.mean(),
+        learning_curve(stats[:, 3], baseline, eval_returns.mean(),
                        os.path.join(out_dir, "learning_curve_cuda.png"),
                        title="Q-learning off-policy batched - BinaryMathEnvCUDAOptimized",
                        ylabel="Retorno (reward CUDA, [-10, 0])",
                        series_label="Q-learning",
+                       xlabel="Batch", point_label="Q-learning media por batch",
                        optimum=0.0, optimum_label="Óptimo (reward 0)")
 
 

@@ -5,7 +5,8 @@ import numpy as np
 
 def learning_curve(returns, baseline, eval_mean, path, title,
                    ylabel="Retorno (reward)", series_label="Agente",
-                   optimum=None, optimum_label="Óptimo"):
+                   optimum=None, optimum_label="Óptimo", xlabel="Episodio",
+                   point_label=None):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -25,7 +26,7 @@ def learning_curve(returns, baseline, eval_mean, path, title,
 
     fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(idx, returns[idx], alpha=0.15, color="tab:blue",
-            label=f"{series_label} por episodio")
+            label=point_label or f"{series_label} por episodio")
     ax.plot(np.arange(window - 1, len(returns)), smooth, color="tab:blue",
             label=f"{series_label} media móvil (w={window})")
     ax.axhline(baseline.mean(), color="tab:gray", ls="--",
@@ -34,7 +35,7 @@ def learning_curve(returns, baseline, eval_mean, path, title,
                label=f"Eval greedy {eval_mean:.2f}")
     if optimum is not None:
         ax.axhline(optimum, color="tab:red", ls="-.", lw=0.8, label=optimum_label)
-    ax.set_xlabel("Episodio")
+    ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
     ax.set_title(title)
     ax.legend()
