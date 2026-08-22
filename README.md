@@ -40,16 +40,22 @@ python train_mc_cuda.py --n-envs 512 --episodes 100000
 python train_qlearning_cuda.py --n-envs 512 --episodes 100000
 python train_sarsa_cuda.py --n-envs 512 --episodes 100000
 
-# Verificar el Verilog del mejor circuito encontrado (desde la raíz del repo)
-iverilog -s test_multiplier_tb -o out/simv out/montecarlo_cuda/best_multiplier_cuda.v verification/test_multiplier_tb.v
+# Verificar el Verilog del mejor circuito encontrado (desde la raíz del repo).
+# Un solo testbench universal sirve para cualquier --bits: pasa el ancho con -D.
+iverilog -s tb_multiplier -D BITS=2 -o out/simv out/montecarlo_cuda/best_multiplier_cuda.v verification/tb_multiplier_universal.v
 vvp out/simv
+
+# Para otros anchos, cambia BITS y el DUT:
+iverilog -s tb_multiplier -D BITS=6 -o out/simv out/montecarlo_cuda/bits6/best_multiplier_cuda.v verification/tb_multiplier_universal.v
+vvp out/simv   # PASS/FAIL + MAE, Peak Error y % de respuestas exactas
 ```
 
-Nota: los testbenches y la plantilla viven en `verification/` (versionados) y
-los circuitos generados en `out/<algo>/` (ignorados por git). El testbench de
-2 bits es el que verifica `best_multiplier_cuda.v` tras entrenar con `--bits 2`;
-para otros `--bits` hay que generar un testbench equivalente (anchos `[N-1:0]`
-y barrido hasta `2^N-1`).
+Nota: el testbench universal y la plantilla viven en `verification/`
+(versionados) y los circuitos generados en `out/<algo>/` (ignorados por git).
+El testbench hace un barrido exhaustivo 2^BITS × 2^BITS comparando con A·B;
+sin `-D BITS=<n>` compila por defecto a 2 bits. El número de productos
+parciales no es visible desde la simulación: se cuenta con
+`grep -c "wire pp" <dut>.v`.
 
 ## Algoritmos
 
@@ -87,7 +93,7 @@ Si hay menos de 5 circuitos distintos, se guardan los que haya.
   - `agents/cpu/` — `base.py` (tabular CPU), `montecarlo.py`, `qlearning.py`, `sarsa.py`
   - `agents/cuda/` — `base.py` (tabular batched), `montecarlo.py`, `qlearning.py`, `sarsa.py`
 - `training/` — helpers compartidos: `baseline.py`, `plot.py`, `artifacts.py` (TopK + export Verilog)
-- `verification/` — plantilla y testbenches versionados (`testbench_template.v`, `test_multiplier_tb.v`, `test_multiplier_4bit_tb.v`)
+- `verification/` — testbench universal (`tb_multiplier_universal.v`, parametrizado con `-D BITS=<n>`) y plantilla del entorno CPU (`testbench_template.v`)
 - `docs/environment.md` — documentación exhaustiva de los entornos
 - `out/` — resultados por agente (Q, returns, `best_multiplier*.v`, plots) y scratch de Verilog (`out/verilog/`)
 
