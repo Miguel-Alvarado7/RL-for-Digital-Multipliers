@@ -16,7 +16,7 @@ module multiplier (
     wire [1:0] columna4 = pp0;
     wire [1:0] columna3 = pp1 + pp0;
     wire [1:0] columna2 = pp2 + pp4;
-    wire [1:0] columna1 = pp3 + pp0;
+    wire [1:0] columna1 = pp3;
     assign P = (columna4 << 3) + (columna3 << 2) + (columna2 << 1) + (columna1 << 0);
 
 endmodule

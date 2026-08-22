@@ -7,10 +7,10 @@ module multiplier (
 
     // Generación de productos parciales (sin redundancias)
     wire pp0 = 0;
-    wire pp1 = (A[0]&B[1]);
+    wire pp1 = (A[1]&B[0]);
     wire pp2 = (A[0]&B[0]);
     wire pp3 = (A[1]&B[1]);
-    wire pp4 = (A[1]&B[0]);
+    wire pp4 = (A[0]&B[1]);
 
     // Suma de productos parciales
     wire [1:0] columna4 = pp0;

@@ -24,7 +24,7 @@ SARSA_HEIGHT_4 := 3
 #
 # Para recuperar la salida completa:  make all QUIET= LOG_EVERY=100
 QUIET := --quiet
-LOG_EVERY := 1000
+LOG_EVERY := 10000
 
 .PHONY: all qlearning-cuda montecarlo-cuda sarsa-cuda clean
 
