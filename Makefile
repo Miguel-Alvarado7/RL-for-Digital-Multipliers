@@ -17,6 +17,15 @@ N_STEPS := 1 20 30
 # por detras (27,5% de error relativo, peor caso 45).
 SARSA_HEIGHT_4 := 3
 
+# Verbosidad. Con 97k batches por corrida el monitoreo greedy imprimia ~9.800
+# lineas y el progreso ~980; --quiet elimina las primeras (y su computo, que no
+# sirve para nada mas) y --log-every espacia las segundas. El early stop no se
+# ve afectado: su corrida greedy de confirmacion se sigue imprimiendo.
+#
+# Para recuperar la salida completa:  make all QUIET= LOG_EVERY=100
+QUIET := --quiet
+LOG_EVERY := 1000
+
 .PHONY: all qlearning-cuda montecarlo-cuda sarsa-cuda clean
 
 # `all` se invoca a si mismo de forma recursiva en vez de declarar los targets
@@ -53,7 +62,8 @@ qlearning-cuda:
 			--height $$b \
 			--n-envs $(N_ENVS) \
 			--episodes $(EPISODES) \
-			--early-stop $(EARLY_STOP); \
+			--early-stop $(EARLY_STOP) \
+			$(QUIET) --log-every $(LOG_EVERY); \
 		d=$$(( $$(date +%s) - r0 )); \
 		printf '    [tiempo] Q-learning bits=%s: %02d:%02d:%02d\n' \
 			"$$b" $$((d/3600)) $$((d%3600/60)) $$((d%60)); \
@@ -74,7 +84,8 @@ montecarlo-cuda:
 			--height $$b \
 			--n-envs $(N_ENVS) \
 			--episodes $(EPISODES) \
-			--early-stop $(EARLY_STOP); \
+			--early-stop $(EARLY_STOP) \
+			$(QUIET) --log-every $(LOG_EVERY); \
 		d=$$(( $$(date +%s) - r0 )); \
 		printf '    [tiempo] Monte Carlo bits=%s: %02d:%02d:%02d\n' \
 			"$$b" $$((d/3600)) $$((d%3600/60)) $$((d%60)); \
@@ -106,7 +117,8 @@ sarsa-cuda:
 				--n-envs $(N_ENVS) \
 				--episodes $(EPISODES) \
 				--n-steps $$n \
-				--early-stop $(EARLY_STOP); \
+				--early-stop $(EARLY_STOP) \
+			$(QUIET) --log-every $(LOG_EVERY); \
 			d=$$(( $$(date +%s) - r0 )); \
 			printf '    [tiempo] SARSA bits=%s n_steps=%s: %02d:%02d:%02d\n' \
 				"$$b" "$$n" $$((d/3600)) $$((d%3600/60)) $$((d%60)); \
