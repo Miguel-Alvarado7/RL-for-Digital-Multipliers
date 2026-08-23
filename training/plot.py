@@ -6,7 +6,17 @@ import numpy as np
 def learning_curve(returns, baseline, eval_mean, path, title,
                    ylabel="Retorno (reward)", series_label="Agente",
                    optimum=None, optimum_label="Óptimo", xlabel="Episodio",
-                   point_label=None):
+                   point_label=None, best_series=None):
+    """Curva de aprendizaje con media móvil vs baseline y eval greedy.
+
+    Args:
+        best_series: opcional, mejor retorno POR BATCH (p. ej. la columna
+            `max` del CSV). Se dibuja su máximo acumulado como línea naranja:
+            el "mejor episodio encontrado hasta ahora", que visualiza cuándo
+            la exploración alcanzó el óptimo aunque la media no lo muestre.
+        baseline: array de retornos del baseline aleatorio; None omite su
+            línea (útil al regenerar gráficos sin ese artefacto).
+    """
     import matplotlib
 
     matplotlib.use("Agg")
@@ -29,8 +39,14 @@ def learning_curve(returns, baseline, eval_mean, path, title,
             label=point_label or f"{series_label} por episodio")
     ax.plot(np.arange(window - 1, len(returns)), smooth, color="tab:blue",
             label=f"{series_label} media móvil (w={window})")
-    ax.axhline(baseline.mean(), color="tab:gray", ls="--",
-               label=f"Baseline aleatorio {baseline.mean():.2f}")
+    if best_series is not None:
+        running_best = np.maximum.accumulate(
+            np.asarray(best_series, dtype=np.float64))
+        ax.plot(idx, running_best[idx], color="tab:orange", lw=1.4,
+                label="Mejor episodio acumulado")
+    if baseline is not None:
+        ax.axhline(baseline.mean(), color="tab:gray", ls="--",
+                   label=f"Baseline aleatorio {baseline.mean():.2f}")
     ax.axhline(eval_mean, color="tab:green", ls=":",
                label=f"Eval greedy {eval_mean:.2f}")
     if optimum is not None:
