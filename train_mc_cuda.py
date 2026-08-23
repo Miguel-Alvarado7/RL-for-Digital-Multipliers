@@ -306,7 +306,8 @@ def main():
             title="Monte Carlo on-policy batched - BinaryMathEnvCUDAOptimized",
             ylabel="Retorno (reward CUDA, [-10, 0])",
             series_label="MC",
-                       xlabel="Batch", point_label="MC media por batch", optimum=0.0, optimum_label="Óptimo (reward 0)",
+            xlabel="Batch", point_label="MC media por batch", optimum=0.0, optimum_label="Óptimo (reward 0)",
+            best_series=stats[:, 6], max_series=stats[:, 6],
         )
 
 

@@ -6,14 +6,17 @@ import numpy as np
 def learning_curve(returns, baseline, eval_mean, path, title,
                    ylabel="Retorno (reward)", series_label="Agente",
                    optimum=None, optimum_label="Óptimo", xlabel="Episodio",
-                   point_label=None, best_series=None):
+                   point_label=None, best_series=None, max_series=None):
     """Curva de aprendizaje con media móvil vs baseline y eval greedy.
 
     Args:
         best_series: opcional, mejor retorno POR BATCH (p. ej. la columna
-            `max` del CSV). Se dibuja su máximo acumulado como línea naranja:
-            el "mejor episodio encontrado hasta ahora", que visualiza cuándo
-            la exploración alcanzó el óptimo aunque la media no lo muestre.
+            `max` del CSV). Se dibuja su media móvil como línea neta (ancho 2,
+            alpha 0.7) en lugar del máximo acumulado: visualiza cuándo la
+            exploración alcanzó el óptimo aunque la media no lo muestre.
+        max_series: opcional, columna `max` del CSV trazada como línea naranja
+            transparente (alpha 0.2, ancho 1.5) de episodios por batch, estilo
+            sólido (sin punteado). Si no se provee, se omite.
         baseline: array de retornos del baseline aleatorio; None omite su
             línea (útil al regenerar gráficos sin ese artefacto).
     """
@@ -40,10 +43,16 @@ def learning_curve(returns, baseline, eval_mean, path, title,
     ax.plot(np.arange(window - 1, len(returns)), smooth, color="tab:blue",
             label=f"{series_label} media móvil (w={window})")
     if best_series is not None:
-        running_best = np.maximum.accumulate(
-            np.asarray(best_series, dtype=np.float64))
-        ax.plot(idx, running_best[idx], color="tab:orange", lw=1.4,
-                label="Mejor episodio acumulado")
+        window = max(10, len(returns) // 50)
+        csum = np.concatenate([[0.0], np.cumsum(best_series, dtype=np.float64)])
+        smooth_best = (csum[window:] - csum[:-window]) / window
+        ax.plot(np.arange(window - 1, len(best_series)), smooth_best,
+                color="tab:orange", lw=2, alpha=0.7,
+                label=f"Mejor episodio media móvil (w={window})")
+    if max_series is not None:
+        ax.plot(idx, np.asarray(max_series)[idx], color="tab:orange", alpha=0.2,
+                lw=1.5,
+                label="Mejor episodio por batch")
     if baseline is not None:
         ax.axhline(baseline.mean(), color="tab:gray", ls="--",
                    label=f"Baseline aleatorio {baseline.mean():.2f}")

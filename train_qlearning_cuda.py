@@ -186,7 +186,8 @@ def main():
                        ylabel="Retorno (reward CUDA, [-10, 0])",
                        series_label="Q-learning",
                        xlabel="Batch", point_label="Q-learning media por batch",
-                       optimum=0.0, optimum_label="Óptimo (reward 0)")
+                       optimum=0.0, optimum_label="Óptimo (reward 0)",
+                       best_series=stats[:, 6], max_series=stats[:, 6])
 
 
 if __name__ == "__main__":

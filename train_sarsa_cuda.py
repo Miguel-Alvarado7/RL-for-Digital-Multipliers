@@ -190,7 +190,8 @@ def main():
                        ylabel="Retorno (reward CUDA, [-10, 0])",
                        series_label="SARSA",
                        xlabel="Batch", point_label="SARSA media por batch",
-                       optimum=0.0, optimum_label="Óptimo (reward 0)")
+                       optimum=0.0, optimum_label="Óptimo (reward 0)",
+                       best_series=stats[:, 6], max_series=stats[:, 6])
 
 
 if __name__ == "__main__":
